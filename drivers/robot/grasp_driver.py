@@ -156,12 +156,16 @@ class GraspDriver:
         self._open_soft_limit = 0.98 * self._angle_open
         self._open_lo = min(self._open_soft_limit, 0.0)
         self._open_hi = max(self._open_soft_limit, 0.0)
-        self._hard_stop_angle = self._open_sign * 0.05
+        # 实测（RS + 柔性夹爪）：空夹机械限位在 pos≈-0.75（指尖互碰，可重复）。
+        # 柔性夹爪握着物体时电机也可能走出几乎整个行程，位置区分度小，
+        # 因此阈值必须贴着实测限位设：-0.65（距限位仅 0.1 余量）。
+        self._hard_stop_angle = self._open_sign * -0.65
         self._arrive_tol = 0.12
         self._kp_move = 5.0
         self._kd_move = 1.0
         self._kd_close = 0.5
-        self._stall_vel = 0.05
+        # self._stall_vel = 0.05
+        self._stall_vel = 0.20
         self._startup_dist = 0.30
         self._state_lock = threading.Lock()
         self._state = self._STATE_IDLE
@@ -172,6 +176,11 @@ class GraspDriver:
         self._position_reached = True
         self._grasp_result: Optional[bool] = None
         self._last_gripper_state: Optional[tuple[float, float, float]] = None
+
+        # Debug: print gripper pos/vel/torq while closing (throttled).
+        # Set to True to calibrate _hard_stop_angle, False for normal runs.
+        self._debug = True
+        self._debug_last_print = 0.0
 
     def start(self) -> None:
         """Start the SDK arm controller and let this driver own the gripper."""
@@ -306,24 +315,50 @@ class GraspDriver:
 
             elif state == self._STATE_CLOSING:
                 command = (0.0, 0.0, 0.0, self._kd_close, self._close_torque)
+
                 if pos_vel_torq is not None:
-                    pos, vel, _ = pos_vel_torq
+                    pos, vel, torq = pos_vel_torq
                     self._contact_pos = pos
                     moved = abs(pos - self._start_pos) >= self._startup_dist
                     at_hard_stop = self._open_sign * pos < self._open_sign * self._hard_stop_angle
-                    if moved and at_hard_stop:
-                        self._target_pos = 0.0
-                        self._state = self._STATE_POSITION
-                        self._position_reached = False
-                        self._grasp_result = False
-                        command = (0.0, 0.0, self._kp_move, self._kd_move, 0.0)
-                    elif moved and abs(vel) < self._stall_vel:
+                    # 接触判据：实测自由闭合时反馈扭矩峰值约 0.24，
+                    # 碰到物体后迅速上升。阈值取命令扭矩的 35%，保证在
+                    # 位置还较高时就能检出接触——软/可压缩物体会被一路压过
+                    # 硬限位阈值，等"停稳"再分类会误判为空夹。
+                    torque_loaded = abs(torq) > 0.35 * abs(self._close_torque)
+                    stopped = abs(vel) < self._stall_vel
+
+                    # 调试打印（节流，每 0.1s 一次）：用于校准 _hard_stop_angle
+                    if self._debug:
+                        now = time.monotonic()
+                        if now - self._debug_last_print >= 0.1:
+                            self._debug_last_print = now
+                            print(f"[gripper] pos={pos:.3f} vel={vel:.3f} torq={torq:.3f}")
+
+                    if moved and torque_loaded and not at_hard_stop:
+                        # 夹到物体：扭矩建立时位置仍明显高于硬限位，
+                        # 立即判定成功，不再等待停稳
                         self._target_pos = pos
                         self._state = self._STATE_HOLDING
                         self._grasp_result = True
                         command = (pos, 0.0, self._kp_move, self._kd_move, self._hold_torque)
+                    elif moved and stopped:
+                        if at_hard_stop:
+                            # 空夹：停稳后位置在机械限位附近
+                            self._target_pos = 0.0
+                            self._state = self._STATE_POSITION
+                            self._position_reached = False
+                            self._grasp_result = False
+                            command = (0.0, 0.0, self._kp_move, self._kd_move, 0.0)
+                        else:
+                            # 夹到物体：停稳后位置明显高于硬限位
+                            self._target_pos = pos
+                            self._state = self._STATE_HOLDING
+                            self._grasp_result = True
+                            command = (pos, 0.0, self._kp_move, self._kd_move, self._hold_torque)
 
             elif state == self._STATE_HOLDING:
+                # 保持夹持：位置 + 保持力矩（原代码此分支嵌在 CLOSING 内，是死代码）
                 command = (self._target_pos, 0.0, self._kp_move, self._kd_move, self._hold_torque)
 
         if command is not None:
@@ -374,6 +409,10 @@ class GraspDriver:
     def get_tcp_pose(self) -> np.ndarray:
         q_arm = self._arm.get_state(request_feedback=False)[0][: self._n]
         q = self._pad_q_for_model(self._model, q_arm, self._n)
+        # compute_fk 的第三个参数是末端 frame 名称（字符串），不是关节数。
+        # 传整数会导致 Pinocchio getFrameId(Model, int) 报错。
+        # 若 SDK 的 compute_fk 要求显式传 frame_name，请改为 URDF 中末端
+        # frame 的名字字符串（查看 kinematics/forward_kinematics.py 里的默认值）。
         pos, rot, _ = self._compute_fk(self._model, q)
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = rot
