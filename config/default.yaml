@@ -36,7 +36,7 @@ robot:
       # close_torque: 1.5
       close_torque: 1.5
       default_force: 0.8
-      post_contact_close_angle: 0.15    # 首次接触后额外闭合 0.12 rad，是本次保守初值。允许范围：0.0～0.30 rad。超出范围会在初始化时直接报错，不会静默放大
+      post_contact_close_angle: 0.2    # 首次接触后额外闭合 0.12 rad，是本次保守初值。允许范围：0.0～0.30 rad。超出范围会在初始化时直接报错，不会静默放大
   ready_pose:
     x: 0.3
     y: 0.0
