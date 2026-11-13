@@ -221,6 +221,10 @@ def main() -> int:
     robot_ready = False
     frozen = False
     last_display: Optional[np.ndarray] = None
+    frame_index = 0
+    live_detections = []
+    live_target = None
+    live_container = None
     window_name = "AnyGrasp Pick and Place"
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -273,12 +277,31 @@ def main() -> int:
                     break
                 continue
 
+            if not frozen:
+                frame_index += 1
+                infer_every = max(1, int(yolo_opts.get("infer_every", 3)))
+                if frame_index == 1 or frame_index % infer_every == 0:
+                    try:
+                        _, live_detections = detect_objects(yolo_model, color_bgr, yolo_opts)
+                        live_target = anygrasp_utils.select_target(live_detections, args.target_class)
+                        live_container = place_utils.select_container(
+                            live_detections, container_class, exclude=live_target
+                        )
+                    except Exception as exc:
+                        print(f"[Live YOLO] detection failed: {exc}")
+
             if frozen and last_display is not None:
                 display = last_display.copy()
             else:
-                display = color_bgr.copy()
+                display = graspnet_utils.draw_detections_overlay(
+                    color_bgr, live_detections, live_target, args.target_class
+                )
+                if live_container is not None:
+                    x1, y1, x2, y2 = live_container.bbox_xyxy
+                    cv2.rectangle(display, (x1, y1), (x2, y2), (255, 180, 0), 3)
+                    cv2.putText(display, f"CONTAINER: {live_container.class_name}", (x1, max(45, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
                 cv2.putText(display, "G=plan pick-place R=resume Q=quit", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-                cv2.putText(display, f"target={args.target_class} container={container_class}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(display, f"LIVE YOLO | target={args.target_class} container={container_class}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q"), 27):
@@ -286,6 +309,7 @@ def main() -> int:
             if key in (ord("r"), ord("R")):
                 frozen = False
                 last_display = None
+                frame_index = 0  # force a fresh YOLO detection on the next live frame
                 continue
             if key not in (ord("g"), ord("G"), ord(" ")):
                 if vis is not None and not vis.poll():
@@ -308,6 +332,16 @@ def main() -> int:
                 container = place_utils.select_container(
                     detections, container_class, exclude=target
                 )
+                # Show the same-frame detections even when workspace/IK rejects the plan.
+                snap_display = graspnet_utils.draw_detections_overlay(
+                    snap_color, detections, target, args.target_class
+                )
+                if container is not None:
+                    x1, y1, x2, y2 = container.bbox_xyxy
+                    cv2.rectangle(snap_display, (x1, y1), (x2, y2), (255, 180, 0), 3)
+                    cv2.putText(snap_display, f"PLACE: {container.class_name}", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
+                last_display = snap_display
+                frozen = True
                 if target is None:
                     raise RuntimeError(f"Target class not found: {args.target_class}")
                 if container is None:
@@ -335,16 +369,9 @@ def main() -> int:
                     ok, error = ik_checker.check(*pose)
                     print(f"[Place IK] {name}: success={ok} error={error:.6f}")
                     place_ik_results.append((name, ok, error))
-
-                failed_place_ik = [
-                    (name, error)
-                    for name, ok, error in place_ik_results
-                    if not ok
-                ]
+                failed_place_ik = [(name, error) for name, ok, error in place_ik_results if not ok]
                 if failed_place_ik:
-                    raise RuntimeError(
-                        f"Place IK failed before any grasp motion: {failed_place_ik}"
-                    )
+                    raise RuntimeError(f"Place IK failed before any grasp motion: {failed_place_ik}")
 
                 preferred_approach_cam = T_cam2base[:3, :3].T @ np.array([0.0, 0.0, -1.0])
                 result = anygrasp_utils.infer_frame(

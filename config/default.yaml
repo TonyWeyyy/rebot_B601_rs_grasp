@@ -35,7 +35,8 @@ robot:
       tau_max: 1.5
       # close_torque: 1.5
       close_torque: 1.5
-      default_force: 0.5
+      default_force: 0.8
+      post_contact_close_angle: 0.15    # 首次接触后额外闭合 0.12 rad，是本次保守初值。允许范围：0.0～0.30 rad。超出范围会在初始化时直接报错，不会静默放大
   ready_pose:
     x: 0.3
     y: 0.0
@@ -136,7 +137,7 @@ place:
   container_class: "box"
 
   # base 坐标系下的 TCP 释放高度，不是相对容器底部的距离
-  height_m: 0.15
+  height_m: 0.10
 
   # 先到容器上方预放置点，再下降 8 cm 到释放点
   pre_place_offset_m: 0.08
@@ -149,10 +150,10 @@ place:
   container_depth_quantile: 0.5
 
   # 保守慢速轨迹
-  pregrasp_duration_s: 2.0
-  grasp_duration_s: 1.5
-  retreat_duration_s: 2.0
-  ready_duration_s: 2.5
-  pre_place_duration_s: 2.5
-  place_duration_s: 1.05
-  release_wait_s: 1.0
+  pregrasp_duration_s: 1.0    # 原 1.5，空爪接近
+  grasp_duration_s: 1.0       # 原 1.2，插入抓取
+  retreat_duration_s: 1.5     # 带物体回撤，保持不变
+  ready_duration_s: 2.0       # 带物体回 ready，保持不变
+  pre_place_duration_s: 2.0   # 带物体前往容器，保持不变
+  place_duration_s: 1.0       # 原 1.2，下降放置
+  release_wait_s: 0.5         # 原 1.0，松爪后的额外等待

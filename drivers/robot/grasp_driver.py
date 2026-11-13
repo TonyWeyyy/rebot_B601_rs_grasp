@@ -110,6 +110,7 @@ class GraspDriver:
     _STATE_IDLE = "idle"
     _STATE_POSITION = "position"
     _STATE_CLOSING = "closing"
+    _STATE_TIGHTENING = "tightening"
     _STATE_HOLDING = "holding"
 
     def __init__(
@@ -142,10 +143,13 @@ class GraspDriver:
 
         selected = selected_arm_config(repo_root)
         defaults = {
-            "dm": {"angle_open": 5.0, "counterclockwise": True, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30},
-            "rs": {"angle_open": 5.0, "counterclockwise": False, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30},
+            "dm": {"angle_open": 5.0, "counterclockwise": True, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30, "post_contact_close_angle": 0.0},
+            "rs": {"angle_open": 5.0, "counterclockwise": False, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30, "post_contact_close_angle": 0.12},
         }[selected.arm_type]
         gcfg = {**defaults, **((gripper_config or {}).get(selected.arm_type) or {})}
+        post_contact_close_angle = float(gcfg["post_contact_close_angle"])
+        if not np.isfinite(post_contact_close_angle) or not 0.0 <= post_contact_close_angle <= 0.30:
+            raise ValueError("gripper post_contact_close_angle must be within [0.0, 0.30] rad")
         motion_sign = 1.0 if bool(gcfg.get("counterclockwise")) else -1.0
         self._angle_open = -motion_sign * abs(float(gcfg["angle_open"]))
         self._tau_max = abs(float(gcfg["tau_max"]))
@@ -167,6 +171,12 @@ class GraspDriver:
         # self._stall_vel = 0.05
         self._stall_vel = 0.20
         self._startup_dist = 0.30
+        # 复杂形状物体可能只有局部先碰到夹爪。首次接触后额外闭合一小段，
+        # 但先完成短暂收紧再返回抓取成功，避免机械臂立即回撤。
+        self._post_contact_close_angle = post_contact_close_angle
+        self._post_contact_arrive_tol = 0.03
+        self._post_contact_timeout_s = 0.30
+        self._tighten_deadline = 0.0
         self._state_lock = threading.Lock()
         self._state = self._STATE_IDLE
         self._target_pos = 0.0
@@ -300,6 +310,38 @@ class GraspDriver:
         with self._state_lock:
             return self._grasp_result is not None
 
+    def _post_contact_target(self, contact_pos: float) -> float:
+        """Return a limited position target slightly past first contact."""
+        target = contact_pos + self._close_sign * self._post_contact_close_angle
+        # 位置模式的闭合边界是 0；硬限位阈值仅用于空抓分类，不能作为
+        # 常规保持目标。两个边界都检查，避免配置或符号错误导致过闭合。
+        if self._close_sign < 0.0:
+            close_limit = max(self._open_lo, self._hard_stop_angle)
+            target = max(target, close_limit)
+        else:
+            close_limit = min(self._open_hi, self._hard_stop_angle)
+            target = min(target, close_limit)
+        return float(np.clip(target, self._open_lo, self._open_hi))
+
+    def _start_post_contact_tightening(
+        self, pos: float, now: float
+    ) -> tuple[float, float, float, float, float]:
+        """Start a short tightening phase, or preserve legacy behavior at 0."""
+        target = self._post_contact_target(pos)
+        self._target_pos = target
+        command = (target, 0.0, self._kp_move, self._kd_move, self._hold_torque)
+        if self._debug:
+            print(f"[gripper] contact pos={pos:.3f} -> tighten target={target:.3f}")
+
+        if self._post_contact_close_angle <= 0.0 or abs(target - pos) <= 1e-9:
+            self._state = self._STATE_HOLDING
+            self._grasp_result = True
+        else:
+            self._state = self._STATE_TIGHTENING
+            self._tighten_deadline = now + self._post_contact_timeout_s
+            self._grasp_result = None
+        return command
+
     def gripper_tick(self, dt: float = 0.0) -> None:
         del dt
         pos_vel_torq = self._read_gripper_state_cached()
@@ -329,19 +371,15 @@ class GraspDriver:
                     stopped = abs(vel) < self._stall_vel
 
                     # 调试打印（节流，每 0.1s 一次）：用于校准 _hard_stop_angle
-                    if self._debug:
-                        now = time.monotonic()
-                        if now - self._debug_last_print >= 0.1:
-                            self._debug_last_print = now
-                            print(f"[gripper] pos={pos:.3f} vel={vel:.3f} torq={torq:.3f}")
+                    now = time.monotonic()
+                    if self._debug and now - self._debug_last_print >= 0.1:
+                        self._debug_last_print = now
+                        print(f"[gripper] pos={pos:.3f} vel={vel:.3f} torq={torq:.3f}")
 
                     if moved and torque_loaded and not at_hard_stop:
-                        # 夹到物体：扭矩建立时位置仍明显高于硬限位，
-                        # 立即判定成功，不再等待停稳
-                        self._target_pos = pos
-                        self._state = self._STATE_HOLDING
-                        self._grasp_result = True
-                        command = (pos, 0.0, self._kp_move, self._kd_move, self._hold_torque)
+                        # 局部接触不代表已经夹稳：向闭合方向额外收紧一小段。
+                        # 保留原来的早期接触判据，避免软物体被一路压到硬限位。
+                        command = self._start_post_contact_tightening(pos, now)
                     elif moved and stopped:
                         if at_hard_stop:
                             # 空夹：停稳后位置在机械限位附近
@@ -351,11 +389,20 @@ class GraspDriver:
                             self._grasp_result = False
                             command = (0.0, 0.0, self._kp_move, self._kd_move, 0.0)
                         else:
-                            # 夹到物体：停稳后位置明显高于硬限位
-                            self._target_pos = pos
-                            self._state = self._STATE_HOLDING
-                            self._grasp_result = True
-                            command = (pos, 0.0, self._kp_move, self._kd_move, self._hold_torque)
+                            # 停稳但位置高于硬限位：仍按物体接触处理并额外收紧。
+                            command = self._start_post_contact_tightening(pos, now)
+
+            elif state == self._STATE_TIGHTENING:
+                # 额外收紧期间不允许上层开始回撤；到位或短超时后再保持。
+                command = (target, 0.0, self._kp_move, self._kd_move, self._hold_torque)
+                arrived = False
+                if pos_vel_torq is not None:
+                    pos = pos_vel_torq[0]
+                    self._contact_pos = pos
+                    arrived = abs(pos - target) <= self._post_contact_arrive_tol
+                if arrived or time.monotonic() >= self._tighten_deadline:
+                    self._state = self._STATE_HOLDING
+                    self._grasp_result = True
 
             elif state == self._STATE_HOLDING:
                 # 保持夹持：位置 + 保持力矩（原代码此分支嵌在 CLOSING 内，是死代码）
@@ -384,6 +431,7 @@ class GraspDriver:
             self._start_pos = start_pos
             self._contact_pos = start_pos
             self._target_pos = 0.0
+            self._tighten_deadline = 0.0
             self._hold_torque = hold_torque
             self._state = self._STATE_CLOSING
             self._position_reached = False
