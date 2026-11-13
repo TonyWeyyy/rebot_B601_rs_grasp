@@ -14,7 +14,10 @@
 | `scripts/anygrasp_camera_demo.py` | 使用项目真实相机/YOLO/Open3D 接口的相机-only 验证 |
 | `scripts/anygrasp_env_check.py` | 环境、权重、gsnet.so、license 只读检查 |
 | `scripts/anygrasp_selfcheck.py` | 无权重、无相机、无机械臂的离线测试 |
-| `config/default.yaml` | 默认估计器切换为 AnyGrasp，新增推理和安全配置 |
+| `scripts/anygrasp_place.py` | 同帧目标/容器检测、放置预检、抓取—搬移—释放完整流程 |
+| `scripts/selftest_anygrasp_place.py` | 放置几何、安全门控和运动顺序离线回归 |
+| `utils/place_utils.py` | 容器中心投影、pre-place/place 位姿与工作区检查 |
+| `config/default.yaml` | 默认估计器切换为 AnyGrasp，新增推理、安全和放置配置 |
 | 原 GraspNet 文件 | 全部保留，可用 CLI 随时回退 |
 
 重要坐标事实：AnyGrasp/GraspNet 抓取坐标系中，**X 轴是接近方向，Y 轴是夹爪开合方向**；`translation` 是抓取中心，指尖位置为 `translation + depth * R[:,0]`。项目原有 `graspnet_rotation_to_rebot_tcp_rotation()` 继续负责到 B601 TCP 的转换，不要重复转换。
@@ -268,6 +271,99 @@ python scripts/grasp.py --estimator anygrasp --dry-run --target-class "toy"
 - grasp/tip 均高于 z 地板，所有位置在工作区；
 - TCP RPY 和夹爪方向与原 GraspNet 同类 top-down 位姿一致；
 - 被拒绝的候选有明确原因，不会强行执行最高分候选。
+
+## 10A. AnyGrasp 抓取放置（新增）
+
+入口：`scripts/anygrasp_place.py`。原 `set.py` / `set2.py` 的 OBB 路线保持不变；AnyGrasp 放置使用独立入口，避免改变已验证的抓取脚本。
+
+### 10A.1 流程与配置
+
+```text
+同一帧检测目标和容器
+→ 根据容器检测框中心与掩膜深度计算容器 XY
+→ 检查 pre-place/place 的工作区与 IK（此时尚未抓取）
+→ AnyGrasp 目标候选、抓取安全检查与 IK
+→ 预抓取 → 抓取 → 闭合 → 回撤 → ready
+→ 预放置 → 放置 → 松爪 → ready
+```
+
+`config/default.yaml` 新增：
+
+```yaml
+place:
+  container_class: "box"
+  height_m: 0.15
+  pre_place_offset_m: 0.08
+  orientation_rpy: [0.0, 1.2, 0.0]
+```
+
+`orientation_rpy` 是固定放置姿态，默认 `0.0/1.2/0.0`。`height_m` 是 base 系 TCP 释放高度，不是相对容器底部的距离；容器底部深度只用于辅助定位，不直接作为释放 Z。首次实验保持大容器、轻质目标和 `0.15 m` 释放高度。
+
+### 10A.2 离线自检
+
+```bash
+cd ~/wey/rebot_developer/rebot_grasp
+python scripts/anygrasp_selfcheck.py
+python scripts/selftest_anygrasp_place.py
+```
+
+放置自检覆盖容器选择、深度投影、pre-place/place、低高度/工作区拒绝、目标容器重复检测、同帧 YOLO 复用、dry-run 零运动、错误确认取消、空抓禁止放置、二次确认取消不释放。
+
+### 10A.3 放置 dry-run
+
+先确认目标和容器都能被 YOLOE 检测，容器与目标在同一相机帧内。`--dry-run --move-ready` **只允许启动时运动到 ready**；后续预抓取、抓取、放置和夹爪动作全部禁止。若机械臂已经处于 ready，可去掉 `--move-ready`，实现完全无运动。
+
+本机若仍出现用户目录 cmeel 与 conda Pinocchio 混库，沿用单进程路径优先级修复：
+
+```bash
+PYTHONPATH="$CONDA_PREFIX/lib/python3.10/site-packages${PYTHONPATH:+:$PYTHONPATH}" \
+python scripts/anygrasp_place.py \
+  --target-class toy --container-class box \
+  --min-base-z 0.05 --dry-run --move-ready
+```
+
+按 G 后必须同时看到：
+
+- `[Detection] target=...` 与 `[Detection] container=...`；
+- `[Place IK] pre-place: success=True` 和 `[Place IK] place: success=True`；
+- `[AnyGrasp safety] pass` 以及目标 IK 成功；
+- 五个 `[Place plan]` 位姿：pregrasp、grasp、retreat、pre-place、place/release；
+- 最后为 `dry run; skip all grasp/place/gripper motions`。
+
+任一日志缺失或出现 `Planning rejected before motion`，都不得进入真机。重点检查容器是否位于 base 工作区内、释放点是否有 IK 解、目标与容器 XY 是否至少相距 5 cm。
+
+### 10A.4 首次真实抓取放置
+
+1. 先保留已成功三次的同一轻质目标，换用大而矮、开口清晰的容器。
+2. 目标与容器分开放置，容器不能遮挡目标；拍照时机械臂保持静止。
+3. 保持 50 mm 高度门槛、87 mm 最终候选宽度上限、45° 倾角上限、碰撞检测和慢速时长不变。
+4. 现场确认 ready→pre-place→place 的整条路径没有支架、相机线、容器壁或人员；程序只预检端点，不证明全臂和轨迹无碰撞。
+5. 急停可触达，人员不进入工作区。执行：
+
+```bash
+PYTHONPATH="$CONDA_PREFIX/lib/python3.10/site-packages${PYTHONPATH:+:$PYTHONPATH}" \
+python scripts/anygrasp_place.py \
+  --target-class toy --container-class box \
+  --min-base-z 0.05 --confirm-motion
+```
+
+非 dry-run 启动时会先运动到 ready。按 G 核对目标和五个位姿后：
+
+- 第一次输入大写 `YES` 才允许抓取和夹爪动作；
+- 抓起、回撤并回 ready 后，第二次输入大写 `PLACE` 才允许前往容器并释放；
+- 其他输入均取消。若第二次取消，物体保持夹持，程序不会自动松爪；
+- 空抓会直接停止放置，不会拿着空气去容器；
+- 正常退出仍沿用原程序的松爪清理；持有物体时不要直接按 Q，先取消流程并人工接管。
+
+### 10A.5 常见拒绝与回退
+
+- `Container class not found`：类别词或检测置信度不足，先改善容器外观、光照、背景和 `custom_classes`。
+- `pre-place/place IK failed`：调整容器位置或保守降低/提高释放高度后重新 dry-run；不要跳过预检。
+- `outside workspace`：容器超出当前 X/Y/Z 边界，优先移动容器，不要直接扩大整个工作区。
+- `Target and container XY are only ...`：目标与容器检测可能重复，或两者摆得太近。
+- 放置阶段异常：立即急停，不依赖程序自动回 ready。
+
+只需抓取时仍使用 `scripts/grasp.py --estimator anygrasp ...`。回退原 GraspNet 抓取使用 `--estimator graspnet`；回退原 OBB 放置继续使用原 `scripts/set2.py`。AnyGrasp 放置入口不修改这些旧路线。
 
 ## 11. 首次真机和逐级开放
 
