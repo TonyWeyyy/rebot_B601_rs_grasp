@@ -74,10 +74,23 @@ python scripts/set.py                        # 抓取并放置（按 Q 退出自
 
 ### GraspNet 路线（6D 姿态，可斜夹/侧夹）
 ```bash
-python scripts/graspnet_camera_demo.py                   # 纯相机 Demo，先跑这个
-python scripts/grasp.py --dry-run --target-class "toy"   # dry-run 验证位姿
-python scripts/grasp.py --target-class "toy"             # 真抓
+python scripts/graspnet_camera_demo.py                                  # 纯相机 Demo，先跑这个
+python scripts/grasp.py --estimator graspnet --dry-run --target-class "toy"
+python scripts/grasp.py --estimator graspnet --target-class "toy"       # 真抓
 ```
+
+### AnyGrasp 路线（新增，默认估计器）
+```bash
+python scripts/anygrasp_env_check.py --check-license                    # 不连相机/机械臂
+python scripts/anygrasp_selfcheck.py                                    # 离线几何自检
+python scripts/anygrasp_camera_demo.py --target-class "toy"             # 纯相机 Demo
+python scripts/grasp.py --estimator anygrasp --dry-run --target-class "toy"
+python scripts/grasp.py --estimator anygrasp --target-class "toy"       # 真抓
+```
+- 首次安装、权重与 license：见项目根目录 `AnyGrasp升级操作手册.md`。
+- 默认 `grasp_pipeline.grasp.estimator: anygrasp`；命令行 `--estimator` 优先级更高。
+- **dry-run 现在不会运动到 ready，也不会在退出时开合夹爪**；需先让机械臂处于原观察位形，程序只读取当前关节状态。
+- AnyGrasp 初始只允许偏离竖直向下 45° 以内的候选，并检查工作区、指尖高度和夹爪开口余量。
 按键：`G`/`Space` 推理当前帧，`R` 恢复预览，`Q`/`Esc` 退出。
 
 ---
@@ -90,7 +103,11 @@ python scripts/grasp.py --target-class "toy"             # 真抓
 | 抓取点落在物体太靠上/下沿 | `grasp_pipeline.grasp.depth_quantile` | 抓取深度取点云的分位数 |
 | 预抓取接近高度 | `grasp_pipeline.grasp.pregrasp_offset_m` | **只影响接近轨迹，不影响最终抓取高度** |
 | 防碰桌面底线 | `grasp_pipeline.grasp.min_base_z_m` | 基座系最低抓取 Z，设桌面高度 +1cm |
-| GraspNet 夹不实/插得不够深 | `grasp_pipeline.grasp.insertion_depth_m` | 沿进给方向额外插入深度（默认 0.015） |
+| GraspNet 夹不实/插得不够深 | `grasp_pipeline.grasp.insertion_depth_m` | 沿进给方向额外插入深度（当前 0.02） |
+| AnyGrasp 候选太杂/太慢 | `anygrasp.dense_grasp` | 初始 false；堆叠场景稳定后再试 true |
+| AnyGrasp 目标区域不对 | `anygrasp.lims` / `target_expand_ratio` | 相机系工作区 / YOLO 框扩张；排除机械臂和支架点云 |
+| AnyGrasp 侧抓过多 | `anygrasp.approach_thresh_deg` / `safety.max_tilt_deg` | 推理引导和 base 系最终检查；初始都为 45° |
+| AnyGrasp 位姿越界被拒 | `anygrasp.safety.base_workspace_min/max` | 先核对是否真危险，不要为通过率直接放宽 |
 | 夹不紧留缝 | `robot.gripper.rs.close_torque` / `default_force` | 闭合力矩 / 保持力矩；柔性夹爪建议 close_torque 0.5~0.6、default_force 0.4 |
 | 换检测目标 | `yolo.custom_classes` | 开放词汇类别名列表 |
 | 预备位 | `robot.ready_pose` | 机械臂观察/准备位姿 |
@@ -107,6 +124,9 @@ python scripts/grasp.py --target-class "toy"             # 真抓
 | `Invalid k1=42.37` 警告 | SDK 畸变系数兼容问题，按零畸变处理，不致命 |
 | numpy / ROS 相关报错 | 终端 source 过 ROS，换干净终端 |
 | pointnet2 import 报错 | torch 升级后需重编译扩展（先 export 路径，见第一节） |
+| `create_detector()` 返回 None | AnyGrasp license 与本机 feature id 不匹配，或权重/license 不配套；运行 `anygrasp_env_check.py --check-license` |
+| `MinkowskiEngine` 编译失败 | 确认使用 `chenxi-wang/MinkowskiEngine` 的 `cuda-13` 分支，且 nvcc 与 torch CUDA 13 匹配 |
+| AnyGrasp 所有候选被 safety 拒绝 | 查看每个 rank 的具体拒绝原因，分别处理倾角、z 地板、工作区或开口；不要关闭 `collision_detection` |
 | 容器 (box) 检测置信度低 | 改善光照/背景对比；把 `custom_classes` 里容器描述写具体（如 `cardboard box`） |
 
 ---

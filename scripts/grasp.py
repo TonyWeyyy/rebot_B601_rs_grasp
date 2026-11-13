@@ -1,14 +1,15 @@
 """
-Visual grasping demo based on GraspNet-baseline and YOLO
+Visual grasping demo based on GraspNet-baseline or AnyGrasp, with YOLO.
 
 Keys:
-  G/Space: run GraspNet on the current RGB-D frame and execute a grasp.
+  G/Space: run the selected estimator on the current RGB-D frame and execute a grasp.
   R: resume live preview.
   Q/Esc: release, home, and exit.
 
 Usage:
-    python scripts/grasp.py --dry-run
-    python scripts/grasp.py --target-class cup
+    python scripts/grasp.py --estimator anygrasp --dry-run
+    python scripts/grasp.py --estimator anygrasp --target-class cup
+    python scripts/grasp.py --estimator graspnet --dry-run  # original route / rollback
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from drivers.robot.grasp_driver import GRIPPER_MAX_DISTANCE_M, GraspDriver, sele
 from reBotArm_control_py.actuator import RebotArm  # noqa: E402
 from reBotArm_control_py.controllers import RebotArmEndPose  # noqa: E402
 import utils.graspnet_utils as graspnet_utils  # noqa: E402
+import utils.anygrasp_utils as anygrasp_utils  # noqa: E402
 from utils.camera_utils import compose_cam_to_base_transform, configure_camera, load_config, load_hand_eye  # noqa: E402
 from utils.transforms import (  # noqa: E402
     canonicalize_parallel_gripper_tcp_rotation,
@@ -133,6 +135,7 @@ def _execute_grasp(
     retreat6d: tuple[float, ...],
     ready_cfg: dict[str, Any],
     dry_run: bool,
+    confirm_motion: bool,
 ) -> bool:
     xg, yg, zg, rxg, ryg, rzg = grasp6d
     xp, yp, zp, rxp, ryp, rzp = pre6d
@@ -146,37 +149,44 @@ def _execute_grasp(
         print("[Grasp] dry run; skip motion")
         return False
 
+    if confirm_motion:
+        print("[Safety] Review the captured target, Open3D grasp, and all three base-frame poses.")
+        confirmation = input("[Safety] Type YES to allow grasp/gripper motion; anything else cancels: ").strip()
+        if confirmation != "YES":
+            print("[Grasp] Motion cancelled by user")
+            return False
+
     print("[Grasp] Open gripper")
     grasp_driver.open_gripper()
 
     print("[Grasp] Move to pregrasp")
-    if not controller.move_to_traj(xp, yp, zp, rxp, ryp, rzp, duration=2.0):
+    if not controller.move_to_traj(xp, yp, zp, rxp, ryp, rzp, duration=4.0):
         print("[Grasp] Pregrasp IK failed")
         return False
-    _wait_motion(controller, 2.0)
+    _wait_motion(controller, 4.0)
 
     print("[Grasp] Move to grasp")
-    if not controller.move_to_traj(xg, yg, zg, rxg, ryg, rzg, duration=1.5):
+    if not controller.move_to_traj(xg, yg, zg, rxg, ryg, rzg, duration=3.0):
         print("[Grasp] Grasp IK failed")
         return False
-    _wait_motion(controller, 1.5)
+    _wait_motion(controller, 3.0)
 
     print("[Grasp] Closing")
     ok = grasp_driver.grasp()
     print("[Grasp] Holding object" if ok else "[Grasp] Empty grasp")
 
     print("[Grasp] Retreat")
-    if controller.move_to_traj(xr, yr, zr, rxr, ryr, rzr, duration=1.5):
-        _wait_motion(controller, 1.5)
+    if controller.move_to_traj(xr, yr, zr, rxr, ryr, rzr, duration=3.0):
+        _wait_motion(controller, 3.0)
 
     print("[Grasp] Return ready")
     _move_ready(controller, ready_cfg)
     return ok
 
 
-def _print_grasp(grasp: Grasp) -> None:
+def _print_grasp(grasp: Grasp, estimator_name: str = "GraspNet") -> None:
     tcp_rotation = canonicalize_parallel_gripper_tcp_rotation(graspnet_rotation_to_rebot_tcp_rotation(grasp.rotation_matrix))
-    print("\n[G] Best GraspNet grasp:")
+    print(f"\n[G] Best {estimator_name} grasp:")
     print(f"  score={grasp.score:.4f} width={grasp.width:.4f} height={grasp.height:.4f} depth={grasp.depth:.4f}")
     print(f"  position_xyz={grasp.translation.tolist()}")
     print(f"  graspnet_rpy={rotation_matrix_to_euler_zyx(grasp.rotation_matrix).tolist()}")
@@ -205,10 +215,12 @@ def _select_executable_grasp(
     retreat_offset_m: float,
     insertion_depth_m: float,
     min_base_z_m: float,
+    anygrasp_safety: Optional[dict[str, Any]] = None,
 ) -> Optional[tuple[Grasp, tuple[float, ...], tuple[float, ...], tuple[float, ...]]]:
     ranked = _rank_grasps(grasps)
     skipped_low = 0
     skipped_ik = 0
+    skipped_geometry = 0
     worst_err = 0.0
 
     for idx in range(len(ranked)):
@@ -224,25 +236,61 @@ def _select_executable_grasp(
             skipped_low += 1
             continue
 
+        if anygrasp_safety is not None:
+            safety = dict(anygrasp_safety)
+            safety["min_base_z_m"] = min_base_z_m
+            reasons, details = anygrasp_utils.check_grasp_base_geometry(
+                grasp, T_cam2base, pre6d, grasp6d, retreat6d, safety
+            )
+            if reasons:
+                skipped_geometry += 1
+                if idx == 0:
+                    print(f"[AnyGrasp debug] workspace_min={np.asarray(safety.get('base_workspace_min', [])).tolist()}")
+                    print(f"[AnyGrasp debug] workspace_max={np.asarray(safety.get('base_workspace_max', [])).tolist()}")
+                    print(f"[AnyGrasp debug] camera_base_xyz={np.round(T_cam2base[:3, 3], 4).tolist()}")
+                    for name, position in details.get("positions", {}).items():
+                        print(f"[AnyGrasp debug] {name}_base_xyz={np.round(position, 4).tolist()}")
+                print(f"[AnyGrasp safety] reject rank={idx + 1}: {'; '.join(reasons)}")
+                continue
+            print(f"[AnyGrasp safety] pass rank={idx + 1} tilt={details['tilt_deg']:.1f}deg")
+
         pre_ok, pre_err = ik_checker.check(*pre6d)
         grasp_ok, grasp_err = ik_checker.check(*grasp6d) if pre_ok else (False, pre_err)
         worst_err = max(worst_err, pre_err, grasp_err)
         if pre_ok and grasp_ok:
             print(f"[G] Executable rank={idx + 1}/{len(ranked)} score={grasp.score:.4f}")
-            if skipped_low or skipped_ik:
-                print(f"[G] Skipped low_z={skipped_low} ik_fail={skipped_ik}")
+            if skipped_low or skipped_ik or skipped_geometry:
+                print(f"[G] Skipped low_z={skipped_low} geometry={skipped_geometry} ik_fail={skipped_ik}")
             return grasp, grasp6d, pre6d, retreat6d
         skipped_ik += 1
 
-    print(f"[G] No IK-reachable grasp: low_z={skipped_low} ik_fail={skipped_ik} max_err={worst_err:.4f}")
+    print(
+        f"[G] No IK-reachable grasp: low_z={skipped_low} geometry={skipped_geometry} "
+        f"ik_fail={skipped_ik} max_err={worst_err:.4f}"
+    )
     return None
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GraspNet robot grasp demo")
+    parser = argparse.ArgumentParser(description="GraspNet / AnyGrasp robot grasp demo")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "config" / "default.yaml"))
-    parser.add_argument("--checkpoint", default=str(GRASPNET_ROOT / "checkpoints" / "checkpoint-rs.tar"))
-    parser.add_argument("--dry-run", action="store_true", help="estimate only; do not move the arm")
+    parser.add_argument("--estimator", choices=("graspnet", "anygrasp"), default=None,
+                        help="override grasp_pipeline.grasp.estimator")
+    parser.add_argument("--checkpoint", default=str(GRASPNET_ROOT / "checkpoints" / "checkpoint-rs.tar"),
+                        help="GraspNet checkpoint")
+    parser.add_argument("--anygrasp-checkpoint", default=None,
+                        help="AnyGrasp checkpoint override; defaults to anygrasp.checkpoint in YAML")
+    parser.add_argument("--dry-run", action="store_true", help="estimate and check IK only; never execute grasp motions")
+    parser.add_argument(
+        "--move-ready",
+        action="store_true",
+        help="with --dry-run, move only to ready_pose at startup; grasp and gripper motions remain disabled",
+    )
+    parser.add_argument(
+        "--confirm-motion",
+        action="store_true",
+        help="after pose selection, require typing YES before grasp/gripper motion; startup ready motion is unchanged",
+    )
     parser.add_argument("--camera-type", choices=("realsense_d435i", "realsense_d405", "orbbec_gemini2"), default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -258,7 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-yolo-class", action="append", default=[], help="add open-vocabulary YOLO class")
     parser.add_argument("--target-margin-px", type=int, default=None)
     parser.add_argument("--target-expand-ratio", type=float, default=None, help="YOLO bbox expansion ratio")
-    parser.add_argument("--no-yolo", action="store_true", help="disable YOLO and use full-scene GraspNet")
+    parser.add_argument("--no-yolo", action="store_true", help="disable YOLO and use full-scene inference")
     parser.add_argument("--yolo-model", default=None)
     parser.add_argument("--yolo-device", default=None)
     parser.add_argument("--yolo-conf", type=float, default=None)
@@ -287,11 +335,19 @@ def main() -> int:
         {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
     )
     grasp_cfg = cfg.get("grasp_pipeline", {}).get("grasp", {})
+    estimator_name = str(args.estimator or grasp_cfg.get("estimator", "graspnet")).lower()
+    if estimator_name not in ("graspnet", "anygrasp"):
+        raise ValueError(f"Unsupported estimator: {estimator_name}")
     pregrasp_offset_m = float(args.pregrasp_offset if args.pregrasp_offset is not None else grasp_cfg.get("pregrasp_offset_m", 0.08))
     retreat_offset_m = float(args.retreat_offset if args.retreat_offset is not None else pregrasp_offset_m)
     insertion_depth_m = float(grasp_cfg.get("insertion_depth_m", 0.0))
     min_base_z_m = float(args.min_base_z if args.min_base_z is not None else grasp_cfg.get("min_base_z_m", 0.03))
     graspnet_cfg = cfg.get("graspnet", {})
+    anygrasp_cfg = dict(cfg.get("anygrasp", {}))
+    anygrasp_safety = dict(anygrasp_cfg.get("safety", {}))
+    anygrasp_safety["max_gripper_width"] = min(
+        GRIPPER_MAX_DISTANCE_M, float(anygrasp_cfg.get("max_gripper_width", GRIPPER_MAX_DISTANCE_M))
+    )
     target_expand_ratio = float(
         args.target_expand_ratio
         if args.target_expand_ratio is not None
@@ -312,7 +368,7 @@ def main() -> int:
     fps_counter = 0
     fps_timer = time.perf_counter()
     fps_value = 0.0
-    window_name = "Main - GraspNet Grasp"
+    window_name = f"Main - {estimator_name} Grasp"
     top_k = int(cfg.get("graspnet", {}).get("top_k", 50))
     vis: Optional[graspnet_utils.Open3DGraspWindow] = None
 
@@ -352,8 +408,12 @@ def main() -> int:
             infer_every_override=args.infer_every_live,
             extra_classes=args.extra_yolo_class,
         )
-        last_target_status = "YOLO disabled: full-scene GraspNet" if yolo_model is None else "target detector warming up..."
-        net = graspnet_utils.build_net(args.checkpoint, args.num_view)
+        last_target_status = f"YOLO disabled: full-scene {estimator_name}" if yolo_model is None else "target detector warming up..."
+        print(f"=== Load estimator: {estimator_name} ===")
+        if estimator_name == "anygrasp":
+            net = anygrasp_utils.build_detector(anygrasp_cfg, args.anygrasp_checkpoint)
+        else:
+            net = graspnet_utils.build_net(args.checkpoint, args.num_view)
 
         print("=== Init robot ===")
         selected = selected_arm_config(robot_cfg.get("repo_root"))
@@ -370,8 +430,15 @@ def main() -> int:
         ik_checker = IkChecker(rebotarm)
         print(f"[Robot] mode: {selected.controller_mode}")
 
-        print("[Robot] Move ready")
-        _move_ready(controller, ready_cfg)
+        if args.dry_run:
+            if args.move_ready:
+                print("[Robot] dry-run: move to ready observation pose only; grasp and gripper motions disabled")
+                _move_ready(controller, ready_cfg)
+            else:
+                print("[Robot] dry-run: stay at the current observation pose; no ready motion")
+        else:
+            print("[Robot] Move ready")
+            _move_ready(controller, ready_cfg)
 
         while True:
             color_bgr, depth_mm = cam.get_frame()
@@ -406,7 +473,7 @@ def main() -> int:
                     display_base,
                     f"LIVE {fps_value:.1f}fps | {status}",
                     last_target_status,
-                    title="Main - GraspNet Grasp",
+                    title=f"Main - {estimator_name} Grasp",
                 )
             cv2.imshow(window_name, display)
 
@@ -422,34 +489,67 @@ def main() -> int:
                 continue
 
             if key in (ord("g"), ord("G"), ord(" ")):
-                print("\n[G] Capture and run GraspNet")
+                print(f"\n[G] Capture and run {estimator_name}")
                 snap_color, snap_depth = cam.get_frame()
                 if snap_color is None or snap_depth is None:
                     print("[G] Frame capture failed")
                     continue
 
-                try:
-                    result = graspnet_utils.infer_frame(
-                        net,
-                        snap_color,
-                        snap_depth,
-                        K,
-                        num_point=args.num_point,
-                        min_depth=args.min_depth,
-                        max_depth=args.max_depth,
-                        collision_thresh=args.collision_thresh,
-                        voxel_size=args.voxel_size,
-                        yolo_model=yolo_model,
-                        yolo_opts=yolo_opts,
-                        target_class=args.target_class,
-                        target_margin_px=int(
-                            args.target_margin_px
-                            if args.target_margin_px is not None
-                            else graspnet_cfg.get("target_margin_px", 12)
-                        ),
-                        target_expand_ratio=target_expand_ratio,
-                        max_grasp_width_m=GRIPPER_MAX_DISTANCE_M,
+                # Freeze the eye-in-hand transform at capture time. The arm must stay
+                # at the observation pose during inference and pose selection.
+                T_cam2base_capture = None
+                preferred_approach_cam = None
+                if T_hand_eye is not None:
+                    T_cam2base_capture = compose_cam_to_base_transform(
+                        grasp_driver.get_tcp_pose(), T_hand_eye, cfg
                     )
+                    if estimator_name == "anygrasp":
+                        preferred_approach_cam = T_cam2base_capture[:3, :3].T @ np.array([0.0, 0.0, -1.0])
+
+                try:
+                    if estimator_name == "anygrasp":
+                        result = anygrasp_utils.infer_frame(
+                            net,
+                            snap_color,
+                            snap_depth,
+                            K,
+                            cfg=anygrasp_cfg,
+                            min_depth=float(anygrasp_cfg.get("min_depth", args.min_depth)),
+                            max_depth=float(anygrasp_cfg.get("max_depth", args.max_depth)),
+                            yolo_model=yolo_model,
+                            yolo_opts=yolo_opts,
+                            target_class=args.target_class,
+                            target_margin_px=int(
+                                args.target_margin_px
+                                if args.target_margin_px is not None
+                                else anygrasp_cfg.get("target_margin_px", 12)
+                            ),
+                            target_expand_ratio=float(anygrasp_cfg.get("target_expand_ratio", target_expand_ratio)),
+                            max_grasp_width_m=GRIPPER_MAX_DISTANCE_M,
+                            preferred_approach_cam=preferred_approach_cam,
+                        )
+                    else:
+                        result = graspnet_utils.infer_frame(
+                            net,
+                            snap_color,
+                            snap_depth,
+                            K,
+                            num_point=args.num_point,
+                            min_depth=args.min_depth,
+                            max_depth=args.max_depth,
+                            collision_thresh=args.collision_thresh,
+                            voxel_size=args.voxel_size,
+                            yolo_model=yolo_model,
+                            yolo_opts=yolo_opts,
+                            target_class=args.target_class,
+                            target_margin_px=int(
+                                args.target_margin_px
+                                if args.target_margin_px is not None
+                                else graspnet_cfg.get("target_margin_px", 12)
+                            ),
+                            target_expand_ratio=target_expand_ratio,
+                            max_grasp_width_m=GRIPPER_MAX_DISTANCE_M,
+                        )
                 except Exception as exc:
                     status = f"inference failed: {exc}"
                     print(f"[G] {status}")
@@ -465,7 +565,7 @@ def main() -> int:
                 if not args.no_open3d:
                     try:
                         if vis is None:
-                            vis = graspnet_utils.Open3DGraspWindow("GraspNet Grasps", top_k)
+                            vis = graspnet_utils.Open3DGraspWindow(f"{estimator_name} Grasps", top_k)
                         vis.update(result.o3d_cloud, vis_grasps)
                         print(f"[G] Open3D {args.open3d_grasps} candidates={len(vis_grasps)}")
                     except Exception as exc:
@@ -475,7 +575,7 @@ def main() -> int:
                             vis = None
 
                 if result.best is None:
-                    print("[G] No valid GraspNet grasp")
+                    print(f"[G] No valid {estimator_name} grasp")
                     continue
                 frozen = True
                 display_base = snap_color
@@ -486,7 +586,7 @@ def main() -> int:
                     f"SNAPSHOT | {status}",
                     last_target_status,
                     frozen=True,
-                    title="Main - GraspNet Grasp",
+                    title=f"Main - {estimator_name} Grasp",
                 )
                 last_display = snap_display
 
@@ -496,7 +596,7 @@ def main() -> int:
                     print("[G] Hand-eye calibration unavailable")
                     continue
 
-                T_cam2base = compose_cam_to_base_transform(grasp_driver.get_tcp_pose(), T_hand_eye, cfg)
+                T_cam2base = T_cam2base_capture
                 selected = _select_executable_grasp(
                     ik_checker,
                     result.grasps,
@@ -505,13 +605,14 @@ def main() -> int:
                     retreat_offset_m,
                     insertion_depth_m,
                     min_base_z_m,
+                    anygrasp_safety=anygrasp_safety if estimator_name == "anygrasp" else None,
                 )
                 if selected is None:
                     print(f"[G] No IK-reachable grasp above min_base_z={min_base_z_m:.3f}m ")
                     continue
                 best, grasp6d, pre6d, retreat6d = selected
 
-                _print_grasp(best)
+                _print_grasp(best, estimator_name)
                 graspnet_utils.draw_best_grasp_projection(snap_display, best, K)
                 last_display = snap_display
 
@@ -523,6 +624,7 @@ def main() -> int:
                     retreat6d,
                     ready_cfg,
                     dry_run=args.dry_run,
+                    confirm_motion=args.confirm_motion,
                 )
 
             if vis is not None and not vis.poll():
@@ -532,7 +634,7 @@ def main() -> int:
     finally:
         print("\n[Exit] Release gripper and home")
         try:
-            if robot_ready and grasp_driver is not None and controller is not None and getattr(controller, "_running", False):
+            if not args.dry_run and robot_ready and grasp_driver is not None and controller is not None and getattr(controller, "_running", False):
                 grasp_driver.release_gripper()
         except Exception as exc:
             print(f"[Exit] {exc}")
