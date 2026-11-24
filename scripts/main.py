@@ -4,7 +4,7 @@ Ordinary visual grasping demo based on YOLO.
 Keys:
   G: capture the current RGB-D frame and execute the best grasp.
   R: resume live preview.
-  Q/Esc: exit (releases gripper and homes in real mode; zero motion in --dry-run).
+  Q/Esc: exit (safe-homes arm before disabling motors; releases gripper only in real mode).
 
 Usage:
     python scripts/main.py

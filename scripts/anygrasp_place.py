@@ -8,10 +8,12 @@ Workflow:
 Keys:
   G/Space: capture and plan one pick-and-place task.
   R: resume live preview.
-  Q/Esc: exit (releases gripper and homes in real mode; zero motion in --dry-run).
+  Q/Esc: exit (safe-homes arm before disabling motors; releases gripper only in real mode).
 
 Safety:
-  --dry-run never executes grasp/place/gripper motions and never moves at exit.
+  --dry-run never executes grasp/place/gripper motions; on exit it still runs
+            safe_home() before disabling motors (no-op if already at zero) to
+            prevent gravity drop on a brakeless arm.
   --move-ready explicitly permits only the initial ready motion in dry-run.
   --confirm-motion requires YES before grasp and PLACE before transfer/release.
 """
@@ -77,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anygrasp-checkpoint", default=None)
     parser.add_argument("--min-base-z", type=float, default=None)
     parser.add_argument("--place-height", type=float, default=None, help="TCP release height in base frame, meters")
-    parser.add_argument("--dry-run", action="store_true", help="plan and check IK only; no grasp/place/exit motion")
+    parser.add_argument("--dry-run", action="store_true", help="plan and check IK only; no grasp/place/gripper motion (safe-homes on exit)")
     parser.add_argument("--move-ready", action="store_true", help="with --dry-run, move only to ready at startup")
     parser.add_argument("--confirm-motion", action="store_true", help="require YES before grasp and PLACE before release")
     parser.add_argument("--no-open3d", action="store_true")

@@ -289,8 +289,10 @@ def execute_pick_and_place_sequence(
 class RobotSession:
     """Managed lifecycle for reBotArm + RebotArmEndPose + GraspDriver + IkChecker.
 
-    Guarantees that ``dry_run=True`` never triggers unexpected arm or gripper
-    motion at startup (unless ``move_ready_in_dry_run=True``) or at exit.
+    In ``dry_run=True`` mode, grasp/place/gripper motions are disabled and
+    startup stays at the current pose unless ``move_ready_in_dry_run=True``.
+    On exit, ``safe_home()`` ALWAYS runs before disabling motors (no-op if the
+    arm is already parked at zero) so a brakeless arm never drops under gravity.
     """
 
     def __init__(
@@ -357,7 +359,7 @@ class RobotSession:
                 print("[Robot] dry-run: move to ready observation pose only; grasp and gripper motions disabled")
                 self.move_ready()
             else:
-                print("[Robot] dry-run: stay at current observation pose; no startup or exit motion")
+                print("[Robot] dry-run: stay at current observation pose; grasp and gripper motions disabled")
         else:
             print("[Robot] Move ready")
             self.move_ready()
@@ -378,23 +380,22 @@ class RobotSession:
     def close(self) -> None:
         if not self._started and self.arm is None:
             return
-        safe_home = not self.dry_run
+        # NEVER disable motors without safe_home() on a brakeless arm: if the
+        # arm is elevated (e.g. after --move-ready), disabling torque directly
+        # causes the arm to drop under gravity. When already at zero, safe_home()
+        # returns immediately without moving.
+        safe_home = True
         release = not self.dry_run
         if self.dry_run:
-            print("\n[Exit] Dry-run cleanup (stopping control loop without homing or gripper motion)")
+            print("\n[Exit] Dry-run cleanup: safe-homing arm before motor disable (gripper motion skipped)")
         else:
-            print("\n[Exit] Release gripper and home")
+            print("\n[Exit] Release gripper and safe-home arm")
 
         try:
             if self.grasp_driver is not None:
                 self.grasp_driver.stop(safe_home=safe_home, release=release)
             elif self.controller is not None and getattr(self.controller, "_running", False):
-                if safe_home:
-                    self.controller.end()
-                else:
-                    self.arm.stop_control_loop()
-                    self.controller._running = False
-                    self.arm.disconnect()
+                self.controller.end()
             elif self.arm is not None:
                 self.arm.disconnect()
         except Exception as exc:

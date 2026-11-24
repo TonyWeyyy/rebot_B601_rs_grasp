@@ -4,7 +4,7 @@ Visual grasping demo based on GraspNet-baseline or AnyGrasp, with YOLO.
 Keys:
   G/Space: run the selected estimator on the current RGB-D frame and execute a grasp.
   R: resume live preview.
-  Q/Esc: exit (releases gripper and homes in real mode; zero motion in --dry-run).
+  Q/Esc: exit (safe-homes arm before disabling motors; releases gripper only in real mode).
 
 Usage:
     python scripts/grasp.py --estimator anygrasp --dry-run
@@ -132,11 +132,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anygrasp-checkpoint", default=None,
                         help="AnyGrasp checkpoint override; defaults to anygrasp.checkpoint in YAML")
     parser.add_argument("--dry-run", action="store_true",
-                        help="estimate and check IK only; never execute grasp or exit motions")
+                        help="estimate and check IK only; never execute grasp/gripper motions (safe-homes on exit)")
     parser.add_argument(
         "--move-ready",
         action="store_true",
-        help="with --dry-run, move only to ready_pose at startup; grasp, gripper, and exit motions remain disabled",
+        help="with --dry-run, move only to ready_pose at startup; grasp and gripper motions remain disabled",
     )
     parser.add_argument(
         "--confirm-motion",

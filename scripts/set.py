@@ -10,7 +10,7 @@ Workflow:
 Keys:
   G: capture and execute pick-and-place
   R: resume live preview
-  Q/Esc: exit (releases gripper and homes in real mode; zero motion in --dry-run)
+  Q/Esc: exit (safe-homes arm before disabling motors; releases gripper only in real mode)
 
 Usage:
     python scripts/set.py

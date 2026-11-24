@@ -16,9 +16,14 @@ from drivers.robot.grasp_driver import GraspDriver, _DEFAULT_GRIPPER_BY_ARM
 
 
 class _FakeArm:
-    def __init__(self):
+    def __init__(self, q_now=None):
         self.stopped_loop = False
         self.disconnected = False
+        self._q_now = [0.0] * 6 if q_now is None else list(q_now)
+
+    def get_state(self, request_feedback: bool = True):
+        del request_feedback
+        return (self._q_now, [0.0] * len(self._q_now), [0.0] * len(self._q_now))
 
     def stop_control_loop(self):
         self.stopped_loop = True
@@ -39,9 +44,10 @@ class _FakeController:
         self._running = False
 
 
-def _make_bare_driver(arm_type: str = "rs") -> GraspDriver:
+def _make_bare_driver(arm_type: str = "rs", q_now=None) -> GraspDriver:
     driver = GraspDriver.__new__(GraspDriver)
-    driver._arm = _FakeArm()
+    driver._arm = _FakeArm(q_now=q_now)
+    driver._n = 6
     driver._controller = _FakeController()
     driver._gripper_motor = None
     driver._last_gripper_state = None
@@ -85,8 +91,15 @@ class CameraAndDriverTest(unittest.TestCase):
         driver._last_gripper_state = (-0.70, 0.0, -0.8)
         self.assertFalse(driver.is_holding())
 
-    def test_stop_without_safe_home_skips_controller_end(self):
-        driver = _make_bare_driver("rs")
+    def test_stop_forces_safe_home_when_arm_not_parked(self):
+        # Arm elevated at ready pose -> MUST force controller.end() (safe_home) even if safe_home=False!
+        driver = _make_bare_driver("rs", q_now=[0.0, 0.7, -0.8, 0.0, 0.4, 0.0])
+        driver.stop(safe_home=False, release=False)
+        self.assertTrue(driver._controller.end_called)
+        self.assertTrue(driver._controller._stop_send.is_set())
+
+    def test_stop_allows_direct_disconnect_only_when_already_parked_at_zero(self):
+        driver = _make_bare_driver("rs", q_now=[0.0, 0.01, -0.01, 0.0, 0.0, 0.0])
         driver.stop(safe_home=False, release=False)
         self.assertFalse(driver._controller.end_called)
         self.assertFalse(driver._controller._running)

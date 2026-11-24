@@ -287,31 +287,57 @@ class GraspDriver:
         self._arm.start_control_loop(self._loop_cb)
         self._controller._running = True
 
-    def stop(self, *, safe_home: bool = True, release: bool = False) -> None:
-        """Stop control and disconnect.
+    def _stop_send_thread(self) -> None:
+        stop_send = getattr(self._controller, "_stop_send", None)
+        if stop_send is not None:
+            stop_send.set()
+        send_thread = getattr(self._controller, "_send_thread", None)
+        if send_thread is not None and send_thread.is_alive():
+            send_thread.join(timeout=2.0)
 
-        When ``safe_home=False`` (e.g. ``--dry-run``), the arm and gripper do
-        not execute any exit motion: the control loop is stopped and the bus is
-        disconnected directly.
+    def _is_arm_parked_at_home(self, tol_rad: float = 0.05) -> bool:
+        """Return True only if current arm joint positions are confirmed near zero."""
+        if self._arm is None or not hasattr(self._arm, "get_state"):
+            return False
+        try:
+            n = int(getattr(self, "_n", 6))
+            q_now = np.asarray(self._arm.get_state(request_feedback=False)[0][:n], dtype=np.float64)
+            if q_now.size == 0 or not np.isfinite(q_now).all():
+                return False
+            return float(np.max(np.abs(q_now))) <= float(tol_rad)
+        except Exception:
+            return False
+
+    def stop(self, *, safe_home: bool = True, release: bool = False) -> None:
+        """Stop control cleanly and disconnect.
+
+        The reBot B601 arm has no mechanical brakes: calling ``disconnect()``
+        disables all motors immediately. Therefore, whenever the controller is
+        running, ``safe_home()`` MUST execute before disabling motors unless the
+        arm is already confirmed parked at zero (``max(|q|) <= 0.05 rad``).
         """
         running = bool(getattr(self._controller, "_running", False))
+        if running:
+            self._stop_send_thread()
+
         if release and running:
             try:
                 self.release_gripper()
             except Exception as exc:
                 print(f"[GraspDriver] release_gripper failed during stop: {exc}")
 
+        if running and not safe_home and not self._is_arm_parked_at_home():
+            print(
+                "[Safety] Arm is not parked at home; forcing safe_home() "
+                "before disabling motors to prevent gravity drop."
+            )
+            safe_home = True
+
         if running and safe_home:
             self._controller.end()
             return
 
         if running:
-            stop_send = getattr(self._controller, "_stop_send", None)
-            if stop_send is not None:
-                stop_send.set()
-            send_thread = getattr(self._controller, "_send_thread", None)
-            if send_thread is not None and send_thread.is_alive():
-                send_thread.join(timeout=2.0)
             try:
                 self._arm.stop_control_loop()
             except Exception:
@@ -350,8 +376,19 @@ class GraspDriver:
             tau=np.array([tau_cmd], dtype=np.float64),
         )
 
-    def _prime_arm_target(self) -> None:
-        q_now = self._arm.get_state()[0][: self._n]
+    def _prime_arm_target(self, timeout: float = 1.0) -> None:
+        motor_map = getattr(self._arm, "_motor_map", None)
+        arm_names = getattr(self._arm_group, "joint_names", []) if self._arm_group is not None else []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            q_now = self._arm.get_state()[0][: self._n]
+            if not motor_map or not arm_names:
+                break
+            if all(motor_map[name].get_state() is not None for name in arm_names if name in motor_map):
+                break
+            time.sleep(0.02)
+        else:
+            q_now = self._arm.get_state()[0][: self._n]
         self._controller._q_target[:] = q_now
         self._controller._qd_target[:] = 0.0
 

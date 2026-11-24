@@ -118,7 +118,7 @@ class IkAndSessionTest(unittest.TestCase):
             self.assertFalse(kwargs["run_nms"])
         self.assertEqual(ik_always_fail.chain_calls, 4)
 
-    def test_dry_run_robot_session_never_homes_or_releases_on_exit(self):
+    def test_dry_run_robot_session_safe_homes_without_gripper_release_on_exit(self):
         stop_calls = []
 
         class FakeDriver:
@@ -129,7 +129,9 @@ class IkAndSessionTest(unittest.TestCase):
         session._started = True
         session.grasp_driver = FakeDriver()
         session.close()
-        self.assertEqual(stop_calls, [(False, False)])
+        # Must ALWAYS safe_home before disabling motors to prevent gravity drop;
+        # gripper release remains skipped in dry_run.
+        self.assertEqual(stop_calls, [(True, False)])
 
         stop_calls.clear()
         real_session = RobotSession({}, dry_run=False)
