@@ -280,36 +280,56 @@ graspnet:
 
 ## 目录结构
 
-```
+```text
 rebot_grasp/
 ├── config/
-│   ├── default.yaml              # 主配置文件
+│   ├── default.yaml              # 主配置文件（相对路径）
 │   └── calibration/
 │       └── <camera_type>/
 │           ├── intrinsics.npz    # 相机内参
 │           └── hand_eye.npz      # 手眼标定结果
+├── core/
+│   ├── robot_session.py          # 机械臂会话生命周期、安全退出回零、抓取/放置执行器
+│   ├── ik_planner.py             # 链式 IK 预检与候选综合打分
+│   └── preview_app.py            # 预览帧率统计
 ├── drivers/
 │   ├── camera/
-│   │   ├── base.py               # 相机抽象基类
-│   │   ├── orbbec_gemini2.py     # Gemini 2 驱动
-│   │   └── realsense.py          # RealSense 驱动（备用）
+│   │   ├── base.py               # 相机抽象基类（含多帧深度中值融合）
+│   │   ├── orbbec_gemini2.py     # Gemini 2 驱动（支持序列号选择）
+│   │   └── realsense.py          # RealSense 驱动（支持序列号选择）
 │   └── robot/
-│       └── grasp_driver.py       # 基于机械臂 SDK 的轻量抓取辅助
+│       └── grasp_driver.py       # 夹爪力控状态机、滑落检测与防坠落停止
 ├── calibration/
-│   ├── aruco_pose.py             # ArUco 位姿估计
-│   └── hand_eye.py               # 手眼标定求解
+│   ├── aruco_pose.py             # ArUco 单次检测与绘制
+│   └── hand_eye.py               # 手眼标定求解、残差评估、离群剔除与多求解器对比
 ├── utils/
-│   ├── ordinary_grasp.py         # OBB 抓取姿态估计与可视化
+│   ├── yolo_utils.py             # YOLO / YOLOE 模型加载与检测解析
+│   ├── target_selector.py        # 目标/容器/关键词统一筛选
+│   ├── pointcloud.py             # 点云投影与分割 Mask/BBox 区域引导
+│   ├── visualization.py          # 2D/Open3D 独立可视化模块
+│   ├── grasp_types.py            # 统一 6D 抓取结果与基座变换
+│   ├── anygrasp_utils.py         # AnyGrasp 推理与基座几何安全检查
+│   ├── graspnet_utils.py         # GraspNet 推理（延迟加载 SDK）
+│   ├── ordinary_grasp.py         # 2.5D OBB/Mask 短轴抓取姿态估计
+│   ├── place_utils.py            # 容器定位（Mask 质心）与放置位姿校验
 │   └── transforms.py             # 坐标变换工具
 ├── scripts/
-│   ├── main.py                   # 主抓取程序
-│   ├── set.py                    # 抓取与放置程序
+│   ├── anygrasp_place.py         # AnyGrasp 同帧目标+容器抓取放置（主力推荐）
+│   ├── grasp.py                  # AnyGrasp / GraspNet 6D 抓取主程序
+│   ├── anygrasp_camera_demo.py   # AnyGrasp 纯相机预览
+│   ├── graspnet_camera_demo.py   # GraspNet 纯相机预览
+│   ├── main.py                   # OBB 单物体抓取程序
+│   ├── set.py                    # OBB 参数化抓取放置程序
+│   ├── set2.py                   # OBB 抓取放置预设封装（toy/red -> box）
 │   ├── ordinary_grasp_pipeline.py
 │   ├── object_detection.py
-│   └── collect_handeye_eih.py
-├── sdk/
-│   ├── pyorbbecsdk/              # Orbbec SDK Python 封装
-│   └── reBotArm_control_py/      # reBot Arm SDK
+│   ├── collect_handeye_eih.py    # 眼在手上标定采集与求解
+│   ├── anygrasp_env_check.py     # AnyGrasp 环境与授权检查
+│   ├── anygrasp_selfcheck.py     # AnyGrasp 离线几何自检
+│   ├── selftest_anygrasp_place.py
+│   └── selftest_gripper_tightening.py
+├── tests/                        # 离线单元测试套件（unittest / pytest）
+├── sdk/                          # 第三方 SDK（reBotArm / GraspNet / AnyGrasp）
 └── environment.yml               # 推荐的 conda 环境文件
 ```
 
@@ -400,18 +420,40 @@ python scripts/collect_handeye_eih.py --manual
 python scripts/graspnet_camera_demo.py
 ```
 
-### 6. `scripts/grasp.py` — GraspNet 机械臂抓取程序
+### 6. `scripts/grasp.py` — AnyGrasp / GraspNet 6D 机械臂抓取程序
 
-基于 `graspnet_camera_demo.py` 的估计结果接入机械臂执行流程：YOLO 选择目标，GraspNet 输出 6D 夹取姿态，经手眼标定转换到机械臂基坐标系，再检查 IK 可达性并执行预夹取、夹取、退回动作。调试时建议先使用 `--dry-run` 只打印目标位姿和候选筛选结果。
+支持 `--estimator anygrasp`（默认）与 `--estimator graspnet` 双后端：YOLO 选择目标，多帧深度融合生成点云，经手眼标定转换到机械臂基坐标系，通过几何安全检查与三段链式 IK（`pregrasp -> grasp -> retreat`）后执行抓取。
 
 ```bash
-python scripts/grasp.py --dry-run
-python scripts/grasp.py --target-class "light blue coffee cup"
+# AnyGrasp（默认，先 dry-run 再带确认真机）
+python scripts/grasp.py --estimator anygrasp --target-class toy --dry-run --move-ready
+python scripts/grasp.py --estimator anygrasp --target-class toy --confirm-motion
+
+# GraspNet 路线
+python scripts/grasp.py --estimator graspnet --target-class "light blue coffee cup" --dry-run --move-ready
 ```
 
-### 7. `scripts/object_detection.py` — 基础检测 Demo
+### 7. `scripts/anygrasp_place.py` — AnyGrasp 6D 抓取放置程序（推荐）
 
-纯 YOLO 检测演示，实时显示检测框和置信度，无抓取逻辑。
+同帧检测目标与容器，先完成容器 `pre-place -> place -> post-release-retract` 与目标 `pregrasp -> grasp -> retreat` 链式 IK 预检，再执行抓取、回撤、滑落检测、放置、释放后垂直抬升与回 ready；支持 `--dry-run`、`--move-ready`、`--confirm-motion`（需依次输入 `YES` 与 `PLACE`）。详细操作与重启清单见 [reBot B601-RS 视觉抓取操作指南.md](file:///home/tony/wey/rebot_developer/rebot_grasp/reBot B601-RS 视觉抓取操作指南.md) 与 [AnyGrasp操作指令.md](file:///home/tony/wey/rebot_developer/rebot_grasp/AnyGrasp操作指令.md)。
+
+```bash
+python scripts/anygrasp_place.py --target-class toy --container-class box --min-base-z 0.05 --dry-run --move-ready
+python scripts/anygrasp_place.py --target-class toy --container-class box --min-base-z 0.05 --confirm-motion
+```
+
+### 8. `scripts/object_detection.py` — 基础检测 Demo
+
+纯 YOLO 检测演示，实时显示检测框和 3D 坐标，无抓取逻辑。
+
+### 9. 离线单元测试与自检
+
+```bash
+python -m unittest discover -s tests -v
+python scripts/selftest_gripper_tightening.py
+python scripts/selftest_anygrasp_place.py
+python scripts/anygrasp_selfcheck.py
+```
 
 ---
 
