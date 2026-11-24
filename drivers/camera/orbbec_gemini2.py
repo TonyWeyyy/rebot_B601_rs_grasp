@@ -167,18 +167,21 @@ class OrbbecGemini2(CameraDriver):
             df = frames.get_depth_frame()
             if df is not None:
                 dw, dh = df.get_width(), df.get_height()
-                depth_raw = np.frombuffer(df.get_data(), dtype=np.uint16).reshape(dh, dw)
-                depth_scale = self._depth_scale_mm
-                try:
-                    depth_scale = float(df.get_depth_scale())
-                    self._depth_scale_mm = depth_scale
-                except Exception:
-                    pass
-                depth_mm = np.clip(
-                    np.rint(depth_raw.astype(np.float32) * depth_scale),
-                    0,
-                    np.iinfo(np.uint16).max,
-                ).astype(np.uint16)
+                raw_bytes = memoryview(df.get_data()).cast("B")
+                expected_bytes = int(dw) * int(dh) * 2
+                if len(raw_bytes) == expected_bytes:
+                    depth_raw = np.frombuffer(raw_bytes, dtype=np.uint16).reshape(dh, dw)
+                    depth_scale = self._depth_scale_mm
+                    try:
+                        depth_scale = float(df.get_depth_scale())
+                        self._depth_scale_mm = depth_scale
+                    except Exception:
+                        pass
+                    depth_mm = np.clip(
+                        np.rint(depth_raw.astype(np.float32) * depth_scale),
+                        0,
+                        np.iinfo(np.uint16).max,
+                    ).astype(np.uint16)
 
             if color_bgr is None or depth_mm is None:
                 self._record_frame_failure("missing color or depth frame")

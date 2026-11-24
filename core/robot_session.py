@@ -330,7 +330,9 @@ class RobotSession:
         return arm_group.num_joints if arm_group is not None else None
 
     def start(self) -> "RobotSession":
-        from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
+        from drivers.robot.grasp_driver import GraspDriver, prioritize_env_pinocchio, selected_arm_config
+
+        prioritize_env_pinocchio()
         from reBotArm_control_py.actuator import RebotArm
         from reBotArm_control_py.controllers import RebotArmEndPose
 

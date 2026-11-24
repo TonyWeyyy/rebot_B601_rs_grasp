@@ -14,6 +14,9 @@ class IkChecker:
     """Pinocchio-based endpoint and chained-trajectory IK checker."""
 
     def __init__(self, arm: Any) -> None:
+        from drivers.robot.grasp_driver import prioritize_env_pinocchio
+
+        prioritize_env_pinocchio()
         from reBotArm_control_py.kinematics import (
             get_end_effector_frame_id,
             load_robot_model,

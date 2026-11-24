@@ -21,6 +21,7 @@ GraspDriver:
 
 from __future__ import annotations
 
+import site
 import sys
 import threading
 import time
@@ -30,6 +31,33 @@ from typing import Any, Optional
 
 import numpy as np
 import yaml
+
+
+def prioritize_env_pinocchio() -> None:
+    """Prevent user-site cmeel Pinocchio from shadowing a conda-installed Pinocchio.
+
+    When ``~/.local/.../cmeel.prefix`` is on ``sys.path`` ahead of the active
+    environment's ``site-packages`` while ``LD_LIBRARY_PATH`` points to the
+    environment's ``lib/``, Python loads the user-site ``pinocchio`` binding
+    against the environment's ``libpinocchio_default.so`` and fails with an
+    ``undefined symbol`` error. If the active environment provides its own
+    ``pinocchio`` package, demote ``cmeel.prefix`` entries to the end of
+    ``sys.path`` while keeping other user-site packages (e.g. ``pyorbbecsdk``)
+    untouched.
+    """
+    if "pinocchio" in sys.modules:
+        return
+    try:
+        env_site_dirs = [Path(p) for p in site.getsitepackages()]
+    except Exception:
+        return
+    has_env_pinocchio = any((d / "pinocchio").is_dir() for d in env_site_dirs)
+    if not has_env_pinocchio:
+        return
+    cmeel_entries = [p for p in sys.path if "cmeel.prefix" in p]
+    if not cmeel_entries:
+        return
+    sys.path[:] = [p for p in sys.path if "cmeel.prefix" not in p] + cmeel_entries
 
 
 _CAMERAWS_ROOT = Path(__file__).resolve().parents[2]
@@ -169,6 +197,7 @@ class GraspDriver:
         self._gripper_name = gripper_jcfgs[0].name
         self._gripper_motor: Any = None
 
+        prioritize_env_pinocchio()
         from reBotArm_control_py.kinematics import compute_fk, load_robot_model, pad_q_for_model
 
         self._compute_fk = compute_fk

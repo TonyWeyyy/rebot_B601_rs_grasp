@@ -4,6 +4,7 @@ from .grasp_driver import (
     SelectedArmConfig,
     ensure_rebot_sdk_in_syspath,
     find_rebot_repo_root,
+    prioritize_env_pinocchio,
     selected_arm_config,
     selected_hardware_yaml,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "SelectedArmConfig",
     "ensure_rebot_sdk_in_syspath",
     "find_rebot_repo_root",
+    "prioritize_env_pinocchio",
     "selected_arm_config",
     "selected_hardware_yaml",
 ]

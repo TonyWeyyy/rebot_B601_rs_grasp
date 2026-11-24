@@ -77,8 +77,19 @@ def main() -> int:
                     print("[FAIL] get_feature_id:", exc)
             if args.check_license:
                 try:
-                    gsnet.check_license(str(detection / "license"))
-                    print("[OK] license check passed")
+                    lic_result = gsnet.check_license(str(detection / "license"))
+                    passed = True
+                    if isinstance(lic_result, bool):
+                        passed = lic_result
+                    elif isinstance(lic_result, tuple) and len(lic_result) > 0:
+                        passed = bool(lic_result[0])
+                    elif lic_result is not None and hasattr(lic_result, "__bool__"):
+                        passed = bool(lic_result)
+                    if passed:
+                        print("[OK] license check passed")
+                    else:
+                        failures += 1
+                        print(f"[FAIL] license check returned: {lic_result!r}")
                 except Exception as exc:
                     failures += 1
                     print("[FAIL] license check:", exc)

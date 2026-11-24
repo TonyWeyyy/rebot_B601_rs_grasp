@@ -32,7 +32,9 @@ os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
 from calibration.hand_eye import CalibMode, HandEyeCalibrator
 from drivers.camera import make_camera
-from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
+from drivers.robot.grasp_driver import GraspDriver, prioritize_env_pinocchio, selected_arm_config
+
+prioritize_env_pinocchio()
 from reBotArm_control_py.actuator import RebotArm
 from reBotArm_control_py.controllers import RebotArmEndPose
 from utils.camera_utils import load_config
