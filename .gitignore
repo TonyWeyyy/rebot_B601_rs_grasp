@@ -5,7 +5,15 @@ unused/*
 mobileclip2_b.ts
 __pycache__/
 *.pyc
+.pytest_cache/
 sdk/*
 models/
 *.npz
 *voice*
+CLIP-main/
+CLIP-main.zip
+license_JunranWei/
+license_JunranWei.zip
+*.bak*
+*.before_*
+*.docx

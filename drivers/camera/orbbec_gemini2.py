@@ -7,11 +7,11 @@ OrbbecGemini2:
 """
 from __future__ import annotations
 
-import os
-import numpy as np
-import cv2
 from pathlib import Path
 from typing import Optional, Tuple
+
+import cv2
+import numpy as np
 
 from .base import CameraDriver, CameraFrameError
 
@@ -25,11 +25,13 @@ class OrbbecGemini2(CameraDriver):
         height: int = 720,
         fps: int = 30,
         calib_dir: Optional[str] = None,
+        serial: Optional[str] = None,
     ) -> None:
         self._w = width
         self._h = height
         self._fps = fps
         self._calib_dir = Path(calib_dir) if calib_dir else None
+        self._serial = str(serial).strip() if serial else None
 
         self._pipeline = None
         self._depth_scale_mm: float = 1.0
@@ -42,79 +44,88 @@ class OrbbecGemini2(CameraDriver):
 
     def open(self) -> None:
         """Open the camera pipeline."""
-        # Import first so native load errors stay visible.
         try:
             from pyorbbecsdk import (
-                Pipeline, Config,
-                OBSensorType, OBFormat, OBAlignMode,
+                Config,
                 Context,
+                OBAlignMode,
+                OBFormat,
+                OBSensorType,
+                Pipeline,
             )
         except ImportError as e:
             raise RuntimeError(f"pyorbbecsdk is not installed: {e}") from e
 
-        # Silence noisy native logs during SDK initialization.
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        saved = os.dup(2)
-        os.dup2(devnull, 2)
-        os.close(devnull)
+        ctx = Context()
+        try:
+            from pyorbbecsdk import OBLogSeverity
+            ctx.set_logger_severity(OBLogSeverity.FATAL)
+        except Exception:
+            pass
 
         try:
+            if self._serial is not None:
+                device = self._find_device_by_serial(ctx, self._serial)
+                self._pipeline = Pipeline(device)
+            else:
+                self._pipeline = Pipeline()
+        except Exception as e:
+            raise RuntimeError(
+                f"Orbbec camera not found: {e}\n"
+                "  Check USB connection, serial number, and udev permissions.\n"
+                "  Permission quick fix: sudo chmod a+rw /dev/bus/usb/*/*"
+            ) from e
+
+        cfg = Config()
+
+        # Color stream
+        plist = self._pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        cp = None
+        for fmt in (OBFormat.MJPG, OBFormat.RGB):
             try:
-                from pyorbbecsdk import OBLogSeverity
-                Context().set_logger_severity(OBLogSeverity.FATAL)
+                cp = plist.get_video_stream_profile(self._w, self._h, fmt, self._fps)
+                break
             except Exception:
                 pass
+        if cp is None:
+            cp = plist.get_default_video_stream_profile()
+        cfg.enable_stream(cp)
 
-            try:
-                self._pipeline = Pipeline()
-            except Exception as e:
-                raise RuntimeError(
-                    f"Orbbec camera not found: {e}\n"
-                    "  Check USB connection and udev permissions.\n"
-                    "  Permission quick fix: sudo chmod a+rw /dev/bus/usb/*/*"
-                ) from e
+        # Depth stream
+        dplist = self._pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+        try:
+            dp = dplist.get_video_stream_profile(self._w, self._h, OBFormat.Y16, self._fps)
+        except Exception:
+            dp = dplist.get_default_video_stream_profile()
+        cfg.enable_stream(dp)
 
-            cfg = Config()
+        cfg.set_align_mode(OBAlignMode.HW_MODE)
+        self._pipeline.start(cfg)
+        self._reset_frame_failures()
 
-            # Color stream
-            plist = self._pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-            cp = None
-            for fmt in (OBFormat.MJPG, OBFormat.RGB):
-                try:
-                    cp = plist.get_video_stream_profile(self._w, self._h, fmt, self._fps)
-                    break
-                except Exception:
-                    pass
-            if cp is None:
-                cp = plist.get_default_video_stream_profile()
-            cfg.enable_stream(cp)
+        # Intrinsics from SDK
+        intr = self._pipeline.get_camera_param().rgb_intrinsic
+        self._K = np.array([
+            [intr.fx, 0,       intr.cx],
+            [0,       intr.fy, intr.cy],
+            [0,       0,       1      ],
+        ], dtype=np.float64)
 
-            # Depth stream
-            dplist = self._pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-            try:
-                dp = dplist.get_video_stream_profile(self._w, self._h, OBFormat.Y16, self._fps)
-            except Exception:
-                dp = dplist.get_default_video_stream_profile()
-            cfg.enable_stream(dp)
+        # Distortion
+        self._D = self._load_distortion()
 
-            cfg.set_align_mode(OBAlignMode.HW_MODE)
-            self._pipeline.start(cfg)
-            self._reset_frame_failures()
-
-            # Intrinsics from SDK
-            intr = self._pipeline.get_camera_param().rgb_intrinsic
-            self._K = np.array([
-                [intr.fx, 0,       intr.cx],
-                [0,       intr.fy, intr.cy],
-                [0,       0,       1      ],
-            ], dtype=np.float64)
-
-            # Distortion
-            self._D = self._load_distortion()
-
-        finally:
-            os.dup2(saved, 2)
-            os.close(saved)
+    @staticmethod
+    def _find_device_by_serial(ctx, serial: str):
+        dev_list = ctx.query_devices()
+        count = dev_list.get_count()
+        found_serials = []
+        for idx in range(count):
+            dev = dev_list.get_device_by_index(idx)
+            sn = str(dev.get_device_info().get_serial_number())
+            found_serials.append(sn)
+            if sn == serial:
+                return dev
+        raise RuntimeError(f"Requested Orbbec serial {serial!r} not found (available={found_serials})")
 
     def close(self) -> None:
         if self._pipeline is not None:

@@ -8,8 +8,12 @@ selected_arm_config(): read the SDK hardware YAML and choose controller mode.
 
 GraspDriver:
   start(): start SDK control and attach gripper tick handling.
+  stop(): cleanly stop control loop, optionally releasing and homing.
   open_gripper(): open to a requested jaw distance.
+  set_gripper_distance_async(): non-blocking position command.
+  close_gripper_async(): optional delayed non-blocking close to rest.
   grasp(): close with force control and report object contact.
+  is_holding(): verify the gripper is still holding an object above hard stop.
   release_gripper(): open and return the gripper to closed rest.
   get_gripper_state(): return cached position, velocity, and torque.
   get_tcp_pose(): return the current TCP pose as a 4x4 matrix.
@@ -33,6 +37,36 @@ _REBOT_REPO_NAME = "reBotArm_control_py"
 _DEFAULT_REBOT_REPO = _CAMERAWS_ROOT / "sdk" / _REBOT_REPO_NAME
 
 GRIPPER_MAX_DISTANCE_M = 0.09
+
+_DEFAULT_GRIPPER_BY_ARM = {
+    "dm": {
+        "angle_open": 5.0,
+        "counterclockwise": True,
+        "tau_max": 1.5,
+        "close_torque": 1.0,
+        "default_force": 0.30,
+        "post_contact_close_angle": 0.0,
+        "hard_stop_angle": 0.05,
+        "stall_vel": 0.05,
+        "contact_torque_ratio": 0.45,
+        "post_contact_timeout_s": 0.30,
+        "debug": False,
+    },
+    "rs": {
+        "angle_open": 5.0,
+        "counterclockwise": False,
+        "tau_max": 1.5,
+        "close_torque": 1.5,
+        "default_force": 0.80,
+        "post_contact_close_angle": 0.12,
+        # 实测（RS + 柔性夹爪）：空夹机械限位在 pos≈-0.75，留 0.10 rad 余量。
+        "hard_stop_angle": -0.65,
+        "stall_vel": 0.20,
+        "contact_torque_ratio": 0.35,
+        "post_contact_timeout_s": 0.30,
+        "debug": False,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -112,6 +146,7 @@ class GraspDriver:
     _STATE_CLOSING = "closing"
     _STATE_TIGHTENING = "tightening"
     _STATE_HOLDING = "holding"
+    _contact_torque_ratio = 0.35
 
     def __init__(
         self,
@@ -142,14 +177,38 @@ class GraspDriver:
         self._n = self._arm_group.num_joints
 
         selected = selected_arm_config(repo_root)
-        defaults = {
-            "dm": {"angle_open": 5.0, "counterclockwise": True, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30, "post_contact_close_angle": 0.0},
-            "rs": {"angle_open": 5.0, "counterclockwise": False, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30, "post_contact_close_angle": 0.12},
-        }[selected.arm_type]
+        defaults = _DEFAULT_GRIPPER_BY_ARM[selected.arm_type]
         gcfg = {**defaults, **((gripper_config or {}).get(selected.arm_type) or {})}
+        self._configure_gripper_params(gcfg)
+
+        self._state_lock = threading.Lock()
+        self._state = self._STATE_IDLE
+        self._target_pos = 0.0
+        self._start_pos = 0.0
+        self._contact_pos = 0.0
+        self._hold_torque = self._default_force
+        self._position_reached = True
+        self._grasp_result: Optional[bool] = None
+        self._last_gripper_state: Optional[tuple[float, float, float]] = None
+        self._debug_last_print = 0.0
+
+    def _configure_gripper_params(self, gcfg: dict[str, Any]) -> None:
         post_contact_close_angle = float(gcfg["post_contact_close_angle"])
         if not np.isfinite(post_contact_close_angle) or not 0.0 <= post_contact_close_angle <= 0.30:
             raise ValueError("gripper post_contact_close_angle must be within [0.0, 0.30] rad")
+
+        contact_torque_ratio = float(gcfg.get("contact_torque_ratio", 0.35))
+        if not np.isfinite(contact_torque_ratio) or not 0.0 < contact_torque_ratio < 1.0:
+            raise ValueError("gripper contact_torque_ratio must be within (0.0, 1.0)")
+
+        stall_vel = float(gcfg.get("stall_vel", 0.20))
+        if not np.isfinite(stall_vel) or stall_vel <= 0.0:
+            raise ValueError("gripper stall_vel must be positive")
+
+        post_contact_timeout_s = float(gcfg.get("post_contact_timeout_s", 0.30))
+        if not np.isfinite(post_contact_timeout_s) or post_contact_timeout_s < 0.0:
+            raise ValueError("gripper post_contact_timeout_s must be non-negative")
+
         motion_sign = 1.0 if bool(gcfg.get("counterclockwise")) else -1.0
         self._angle_open = -motion_sign * abs(float(gcfg["angle_open"]))
         self._tau_max = abs(float(gcfg["tau_max"]))
@@ -160,37 +219,19 @@ class GraspDriver:
         self._open_soft_limit = 0.98 * self._angle_open
         self._open_lo = min(self._open_soft_limit, 0.0)
         self._open_hi = max(self._open_soft_limit, 0.0)
-        # 实测（RS + 柔性夹爪）：空夹机械限位在 pos≈-0.75（指尖互碰，可重复）。
-        # 柔性夹爪握着物体时电机也可能走出几乎整个行程，位置区分度小，
-        # 因此阈值必须贴着实测限位设：-0.65（距限位仅 0.1 余量）。
-        self._hard_stop_angle = self._open_sign * -0.65
+        self._hard_stop_angle = self._open_sign * float(gcfg.get("hard_stop_angle", -0.65))
         self._arrive_tol = 0.12
         self._kp_move = 5.0
         self._kd_move = 1.0
         self._kd_close = 0.5
-        # self._stall_vel = 0.05
-        self._stall_vel = 0.20
+        self._stall_vel = stall_vel
+        self._contact_torque_ratio = contact_torque_ratio
         self._startup_dist = 0.30
-        # 复杂形状物体可能只有局部先碰到夹爪。首次接触后额外闭合一小段，
-        # 但先完成短暂收紧再返回抓取成功，避免机械臂立即回撤。
         self._post_contact_close_angle = post_contact_close_angle
         self._post_contact_arrive_tol = 0.03
-        self._post_contact_timeout_s = 0.30
+        self._post_contact_timeout_s = post_contact_timeout_s
         self._tighten_deadline = 0.0
-        self._state_lock = threading.Lock()
-        self._state = self._STATE_IDLE
-        self._target_pos = 0.0
-        self._start_pos = 0.0
-        self._contact_pos = 0.0
-        self._hold_torque = self._default_force
-        self._position_reached = True
-        self._grasp_result: Optional[bool] = None
-        self._last_gripper_state: Optional[tuple[float, float, float]] = None
-
-        # Debug: print gripper pos/vel/torq while closing (throttled).
-        # Set to True to calibrate _hard_stop_angle, False for normal runs.
-        self._debug = True
-        self._debug_last_print = 0.0
+        self._debug = bool(gcfg.get("debug", False))
 
     def start(self) -> None:
         """Start the SDK arm controller and let this driver own the gripper."""
@@ -216,6 +257,43 @@ class GraspDriver:
         self._prime_gripper_state()
         self._arm.start_control_loop(self._loop_cb)
         self._controller._running = True
+
+    def stop(self, *, safe_home: bool = True, release: bool = False) -> None:
+        """Stop control and disconnect.
+
+        When ``safe_home=False`` (e.g. ``--dry-run``), the arm and gripper do
+        not execute any exit motion: the control loop is stopped and the bus is
+        disconnected directly.
+        """
+        running = bool(getattr(self._controller, "_running", False))
+        if release and running:
+            try:
+                self.release_gripper()
+            except Exception as exc:
+                print(f"[GraspDriver] release_gripper failed during stop: {exc}")
+
+        if running and safe_home:
+            self._controller.end()
+            return
+
+        if running:
+            stop_send = getattr(self._controller, "_stop_send", None)
+            if stop_send is not None:
+                stop_send.set()
+            send_thread = getattr(self._controller, "_send_thread", None)
+            if send_thread is not None and send_thread.is_alive():
+                send_thread.join(timeout=2.0)
+            try:
+                self._arm.stop_control_loop()
+            except Exception:
+                pass
+            self._controller._running = False
+
+        if self._arm is not None:
+            try:
+                self._arm.disconnect()
+            except Exception as exc:
+                print(f"[GraspDriver] disconnect failed during stop: {exc}")
 
     def _loop_cb(self, r: Any, dt: float) -> None:
         self._controller._loop_cb(r, dt)
@@ -287,12 +365,48 @@ class GraspDriver:
             raise RuntimeError("Gripper feedback is not ready")
         return state
 
+    def is_holding(self, margin_rad: float = 0.05) -> bool:
+        """Return True if the gripper is in HOLDING state and not collapsed to hard stop."""
+        pos_vel_torq = self._read_gripper_state_cached()
+        with self._state_lock:
+            if self._state != self._STATE_HOLDING:
+                return False
+        if pos_vel_torq is None:
+            return True
+        pos = pos_vel_torq[0]
+        threshold = self._open_sign * self._hard_stop_angle + max(0.0, float(margin_rad))
+        return (self._open_sign * pos) > threshold
+
+    def _distance_to_target_pos(self, distance_m: float) -> float:
+        d = float(np.clip(distance_m, 0.0, self.MAX_DISTANCE_M))
+        raw_target = (d / self.MAX_DISTANCE_M) * self._angle_open
+        return float(np.clip(raw_target, self._open_lo, self._open_hi))
+
     def _set_position_target(self, target: float) -> None:
         with self._state_lock:
             self._target_pos = float(target)
             self._state = self._STATE_POSITION
             self._position_reached = False
             self._grasp_result = None
+
+    def set_gripper_distance_async(self, distance_m: float = 0.0) -> None:
+        """Command the gripper to move to ``distance_m`` without blocking."""
+        self._ensure_running()
+        self._set_position_target(self._distance_to_target_pos(distance_m))
+
+    def close_gripper_async(self, delay_s: float = 0.0) -> threading.Thread:
+        """Close gripper to rest position asynchronously after an optional delay."""
+        self._ensure_running()
+
+        def _worker() -> None:
+            if delay_s > 0.0:
+                time.sleep(float(delay_s))
+            if getattr(self._controller, "_running", False):
+                self._set_position_target(self._distance_to_target_pos(0.0))
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return thread
 
     def _wait_until(self, predicate, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -313,8 +427,6 @@ class GraspDriver:
     def _post_contact_target(self, contact_pos: float) -> float:
         """Return a limited position target slightly past first contact."""
         target = contact_pos + self._close_sign * self._post_contact_close_angle
-        # 位置模式的闭合边界是 0；硬限位阈值仅用于空抓分类，不能作为
-        # 常规保持目标。两个边界都检查，避免配置或符号错误导致过闭合。
         if self._close_sign < 0.0:
             close_limit = max(self._open_lo, self._hard_stop_angle)
             target = max(target, close_limit)
@@ -363,37 +475,27 @@ class GraspDriver:
                     self._contact_pos = pos
                     moved = abs(pos - self._start_pos) >= self._startup_dist
                     at_hard_stop = self._open_sign * pos < self._open_sign * self._hard_stop_angle
-                    # 接触判据：实测自由闭合时反馈扭矩峰值约 0.24，
-                    # 碰到物体后迅速上升。阈值取命令扭矩的 35%，保证在
-                    # 位置还较高时就能检出接触——软/可压缩物体会被一路压过
-                    # 硬限位阈值，等"停稳"再分类会误判为空夹。
-                    torque_loaded = abs(torq) > 0.35 * abs(self._close_torque)
+                    torque_loaded = abs(torq) > self._contact_torque_ratio * abs(self._close_torque)
                     stopped = abs(vel) < self._stall_vel
 
-                    # 调试打印（节流，每 0.1s 一次）：用于校准 _hard_stop_angle
                     now = time.monotonic()
                     if self._debug and now - self._debug_last_print >= 0.1:
                         self._debug_last_print = now
                         print(f"[gripper] pos={pos:.3f} vel={vel:.3f} torq={torq:.3f}")
 
                     if moved and torque_loaded and not at_hard_stop:
-                        # 局部接触不代表已经夹稳：向闭合方向额外收紧一小段。
-                        # 保留原来的早期接触判据，避免软物体被一路压到硬限位。
                         command = self._start_post_contact_tightening(pos, now)
                     elif moved and stopped:
                         if at_hard_stop:
-                            # 空夹：停稳后位置在机械限位附近
                             self._target_pos = 0.0
                             self._state = self._STATE_POSITION
                             self._position_reached = False
                             self._grasp_result = False
                             command = (0.0, 0.0, self._kp_move, self._kd_move, 0.0)
                         else:
-                            # 停稳但位置高于硬限位：仍按物体接触处理并额外收紧。
                             command = self._start_post_contact_tightening(pos, now)
 
             elif state == self._STATE_TIGHTENING:
-                # 额外收紧期间不允许上层开始回撤；到位或短超时后再保持。
                 command = (target, 0.0, self._kp_move, self._kd_move, self._hold_torque)
                 arrived = False
                 if pos_vel_torq is not None:
@@ -405,7 +507,6 @@ class GraspDriver:
                     self._grasp_result = True
 
             elif state == self._STATE_HOLDING:
-                # 保持夹持：位置 + 保持力矩（原代码此分支嵌在 CLOSING 内，是死代码）
                 command = (self._target_pos, 0.0, self._kp_move, self._kd_move, self._hold_torque)
 
         if command is not None:
@@ -414,10 +515,7 @@ class GraspDriver:
 
     def open_gripper(self, distance_m: float = GRIPPER_MAX_DISTANCE_M, timeout: float = 3.0) -> None:
         self._ensure_running()
-        d = float(np.clip(distance_m, 0.0, self.MAX_DISTANCE_M))
-        raw_target = (d / self.MAX_DISTANCE_M) * self._angle_open
-        target = float(np.clip(raw_target, self._open_lo, self._open_hi))
-
+        target = self._distance_to_target_pos(distance_m)
         self._set_position_target(target)
         self._wait_until(self._position_done, timeout)
 
@@ -457,10 +555,6 @@ class GraspDriver:
     def get_tcp_pose(self) -> np.ndarray:
         q_arm = self._arm.get_state(request_feedback=False)[0][: self._n]
         q = self._pad_q_for_model(self._model, q_arm, self._n)
-        # compute_fk 的第三个参数是末端 frame 名称（字符串），不是关节数。
-        # 传整数会导致 Pinocchio getFrameId(Model, int) 报错。
-        # 若 SDK 的 compute_fk 要求显式传 frame_name，请改为 URDF 中末端
-        # frame 的名字字符串（查看 kinematics/forward_kinematics.py 里的默认值）。
         pos, rot, _ = self._compute_fk(self._model, q)
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = rot

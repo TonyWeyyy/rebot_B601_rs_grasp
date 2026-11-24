@@ -11,9 +11,13 @@ from pathlib import Path
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.anygrasp_utils import resolve_anygrasp_paths  # noqa: E402
 
 
-def check_import(name):
+def check_import(name: str):
     try:
         module = importlib.import_module(name)
         print(f"[OK] import {name}: {getattr(module, '__version__', 'unknown')}")
@@ -32,13 +36,7 @@ def main() -> int:
     with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f).get("anygrasp", {})
 
-    sdk_root = Path(str(cfg.get("sdk_root", PROJECT_ROOT / "sdk" / "anygrasp_sdk"))).expanduser()
-    if not sdk_root.is_absolute():
-        sdk_root = PROJECT_ROOT / sdk_root
-    detection = sdk_root / "grasp_detection"
-    checkpoint = Path(str(cfg.get("checkpoint", "log/checkpoint_detection.tar"))).expanduser()
-    if not checkpoint.is_absolute():
-        checkpoint = detection / checkpoint
+    detection, checkpoint = resolve_anygrasp_paths(cfg, project_root=PROJECT_ROOT)
 
     failures = 0
     print("Python:", sys.version)

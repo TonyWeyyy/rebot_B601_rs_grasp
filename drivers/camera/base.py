@@ -3,9 +3,11 @@
 CameraDriver:
   open() / close(): start or stop camera streams.
   get_frame(): return one BGR color frame and one depth-mm frame.
+  get_fused_frame(): capture multiple frames and return median-filtered depth.
   K / D: camera matrix and distortion coefficients.
   warm_up(): drop early frames before inference or calibration.
-  setup_aruco() / detect_aruco() / draw_aruco(): optional ArUco helpers.
+  setup_aruco() / detect_aruco() / draw_aruco() / detect_and_draw_aruco():
+    optional ArUco helpers.
 """
 from __future__ import annotations
 
@@ -17,6 +19,26 @@ import numpy as np
 
 class CameraFrameError(RuntimeError):
     """Raised after repeated camera frame acquisition failures."""
+
+
+def fuse_depth_frames(depth_frames: list[np.ndarray]) -> np.ndarray:
+    """Compute pixel-wise median over non-zero uint16 depth frames."""
+    if not depth_frames:
+        raise ValueError("depth_frames must not be empty")
+    if len(depth_frames) == 1:
+        return depth_frames[0].copy()
+
+    stack = np.stack([np.asarray(d, dtype=np.float32) for d in depth_frames], axis=0)
+    valid = np.isfinite(stack) & (stack > 0.0)
+    has_valid = np.any(valid, axis=0)
+    result = np.zeros(depth_frames[0].shape, dtype=np.uint16)
+    if not np.any(has_valid):
+        return result
+
+    valid_cols = np.where(valid[:, has_valid], stack[:, has_valid], np.nan)
+    med = np.nanmedian(valid_cols, axis=0)
+    result[has_valid] = np.clip(np.rint(med), 0.0, float(np.iinfo(np.uint16).max)).astype(np.uint16)
+    return result
 
 
 class CameraDriver(ABC):
@@ -60,6 +82,33 @@ class CameraDriver(ABC):
             depth_mm: uint16 depth image in millimeters, or None.
         """
 
+    def get_fused_frame(
+        self,
+        n_frames: int = 3,
+        max_attempts: Optional[int] = None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Capture ``n_frames`` RGB-D frames and return the latest color + median depth."""
+        n_frames = max(1, int(n_frames))
+        if n_frames == 1:
+            return self.get_frame()
+
+        attempts = max(n_frames * 2, int(max_attempts)) if max_attempts is not None else n_frames * 3
+        last_color: Optional[np.ndarray] = None
+        depths: list[np.ndarray] = []
+        for _ in range(attempts):
+            color_bgr, depth_mm = self.get_frame()
+            if color_bgr is None or depth_mm is None:
+                continue
+            last_color = color_bgr
+            if not depths or depth_mm.shape == depths[0].shape:
+                depths.append(depth_mm)
+            if len(depths) >= n_frames:
+                break
+
+        if last_color is None or not depths:
+            return None, None
+        return last_color, fuse_depth_frames(depths)
+
     # Intrinsics
 
     @property
@@ -102,6 +151,10 @@ class CameraDriver(ABC):
     def draw_aruco(self, bgr: np.ndarray) -> np.ndarray:
         """Draw detected ArUco markers. Call setup_aruco first."""
         return self._aruco.draw_detected(bgr, self.K, self.D)
+
+    def detect_and_draw_aruco(self, bgr: np.ndarray, axis_length: float = 0.03):
+        """Detect target ArUco marker and draw all detected markers in a single pass."""
+        return self._aruco.detect_and_draw(bgr, self.K, self.D, axis_length=axis_length)
 
     # Context manager
 

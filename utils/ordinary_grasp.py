@@ -9,11 +9,13 @@ import cv2
 import numpy as np
 
 try:
-    from .common_utils import detection_count, tensor_to_numpy
+    from .common_utils import detection_count
     from .transforms import grasp_axes_to_rebot_tcp_rotation
-except ImportError:  
-    from common_utils import detection_count, tensor_to_numpy
+    from .yolo_utils import detection_mask, detection_meta, detection_polygon_mask, obb_points
+except ImportError:
+    from common_utils import detection_count
     from transforms import grasp_axes_to_rebot_tcp_rotation
+    from yolo_utils import detection_mask, detection_meta, detection_polygon_mask, obb_points
 
 
 @dataclass
@@ -54,11 +56,21 @@ def estimate_grasps(
     depth_mm: np.ndarray,
     K: np.ndarray,
     depth_quantile: float = 0.75,
+    approach_mode: str = "camera_z",
 ) -> list[GraspPose]:
     grasps: list[GraspPose] = []
     for result in results:
         for index in range(detection_count(result)):
-            grasps.append(estimate_grasp(result, index, depth_mm, K, depth_quantile=depth_quantile))
+            grasps.append(
+                estimate_grasp(
+                    result,
+                    index,
+                    depth_mm,
+                    K,
+                    depth_quantile=depth_quantile,
+                    approach_mode=approach_mode,
+                )
+            )
     return grasps
 
 
@@ -101,12 +113,23 @@ def estimate_grasp(
     depth_mm: np.ndarray,
     K: np.ndarray,
     depth_quantile: float = 0.75,
+    approach_mode: str = "camera_z",
 ) -> GraspPose:
-    class_name, conf, bbox_xyxy = _detection_meta(result, index)
-    rect_points = _rect_points(result, index, depth_mm.shape, bbox_xyxy)
+    """Estimate a 6D grasp pose from a single YOLO OBB/Seg/Box detection.
+
+    Args:
+        approach_mode:
+          - ``"camera_z"`` (default): approach aligned with camera optical axis
+            ``[0, 0, -1]`` (pointing from object toward camera), avoiding
+            perspective tilt on off-center objects.
+          - ``"ray"``: legacy approach along the camera-to-object ray ``-position``.
+    """
+    image_shape = depth_mm.shape[:2]
+    class_name, conf, bbox_xyxy = detection_meta(result, index, image_shape)
+    rect_points = _rect_points(result, index, image_shape, bbox_xyxy)
     center = rect_points.mean(axis=0).astype(np.float32)
 
-    mask = _depth_mask(result, index, depth_mm.shape, rect_points)
+    mask = _depth_mask(result, index, image_shape, rect_points, bbox_xyxy)
     short_vec_uv, short_len_px = _short_edge(rect_points)
     short_dir_uv = _normalize(short_vec_uv)
     edge_lengths = [float(np.linalg.norm(rect_points[(i + 1) % 4] - rect_points[i])) for i in range(4)]
@@ -148,8 +171,12 @@ def estimate_grasp(
     depth_quantile = float(np.clip(depth_quantile, 0.0, 1.0))
     z_m = float(np.quantile(depth_values, depth_quantile) / 1000.0)
     position = _backproject(float(center[0]), float(center[1]), z_m, K)
-    approach = _normalize(-position)
-    if approach is None:
+
+    if str(approach_mode).lower() == "ray":
+        approach = _normalize(-position)
+        if approach is None:
+            approach = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    else:
         approach = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
     open_axis = _pixel_vec_to_3d(short_dir_uv, z_m, K)
@@ -198,8 +225,9 @@ def estimate_grasp(
     rotation = np.column_stack([grip_axis, open_axis, approach]).astype(np.float32)
     tcp_rotation = grasp_axes_to_rebot_tcp_rotation(rotation[:, 0], rotation[:, 1], rotation[:, 2]).astype(np.float32)
 
+    long_dir_uv = np.array([-short_dir_uv[1], short_dir_uv[0]], dtype=np.float32)
     jaw_width_m = float(np.linalg.norm(_pixel_vec_to_3d(short_dir_uv * grasp_span_px, z_m, K)))
-    object_length_m = float(np.linalg.norm(_pixel_vec_to_3d(short_dir_uv * long_len_px, z_m, K)))
+    object_length_m = float(np.linalg.norm(_pixel_vec_to_3d(long_dir_uv * long_len_px, z_m, K)))
     angle_deg = float(np.degrees(np.arctan2(short_dir_uv[1], short_dir_uv[0])))
 
     return GraspPose(
@@ -236,13 +264,7 @@ def _refine_grasp_line_from_mask(
     short_dir_uv: np.ndarray,
     long_len_px: float,
 ) -> Optional[tuple[np.ndarray, np.ndarray, float]]:
-    """Use the mask's central cross-section to refine the short-axis grasp point.
-
-    The short-axis direction still comes from the OBB/min-area-rect. We only
-    replace the grasp center with the midpoint of the mask's actual thickness
-    around the object's median longitudinal slice, which is more reliable for
-    curved or asymmetric shapes such as bananas.
-    """
+    """Use the mask's central cross-section to refine the short-axis grasp point."""
     ys, xs = np.nonzero(mask > 0)
     if len(xs) < 32:
         return None
@@ -275,64 +297,6 @@ def _refine_grasp_line_from_mask(
     return refined_center.astype(np.float32), short_edge_points, float(grasp_span_px)
 
 
-def _safe_attr_row(container: Any, attr: str, index: int) -> Optional[np.ndarray]:
-    values = getattr(container, attr, None)
-    if values is None:
-        return None
-    try:
-        return tensor_to_numpy(values[index])
-    except Exception:
-        return None
-
-
-def _obb_points(result: Any, index: int) -> Optional[np.ndarray]:
-    obb = getattr(result, "obb", None)
-    if obb is None:
-        return None
-    points = _safe_attr_row(obb, "xyxyxyxy", index)
-    if points is None:
-        points = _safe_attr_row(obb, "xyxyxyxyn", index)
-    if points is None:
-        return None
-    points = np.asarray(points, dtype=np.float32)
-    if points.ndim == 3 and points.shape[0] == 1:
-        points = points[0]
-    if points.ndim == 1 and points.size == 8:
-        points = points.reshape(4, 2)
-    if points.shape != (4, 2):
-        return None
-    if float(np.max(np.abs(points))) <= 1.5:
-        h, w = result.orig_shape[:2]
-        points = points * np.array([w, h], dtype=np.float32)
-    return points.astype(np.float32)
-
-
-def _detection_meta(result: Any, index: int) -> tuple[str, float, tuple[int, int, int, int]]:
-    names = getattr(result, "names", {})
-    obb = getattr(result, "obb", None)
-    if obb is not None:
-        cls_row = _safe_attr_row(obb, "cls", index)
-        conf_row = _safe_attr_row(obb, "conf", index)
-        xyxy_row = _safe_attr_row(obb, "xyxy", index)
-        if cls_row is not None and conf_row is not None:
-            cls_id = int(np.asarray(cls_row).reshape(-1)[0])
-            conf = float(np.asarray(conf_row).reshape(-1)[0])
-            if xyxy_row is not None:
-                x1, y1, x2, y2 = [int(v) for v in np.asarray(xyxy_row).reshape(-1)[:4]]
-            else:
-                points = _obb_points(result, index)
-                min_xy = np.floor(points.min(axis=0)).astype(np.int32)
-                max_xy = np.ceil(points.max(axis=0)).astype(np.int32)
-                x1, y1, x2, y2 = int(min_xy[0]), int(min_xy[1]), int(max_xy[0]), int(max_xy[1])
-            return names.get(cls_id, str(cls_id)), conf, (x1, y1, x2, y2)
-
-    box = result.boxes[index]
-    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].cpu().numpy()]
-    cls_id = int(box.cls[0])
-    conf = float(box.conf[0])
-    return names.get(cls_id, str(cls_id)), conf, (x1, y1, x2, y2)
-
-
 def _rect_from_mask(mask: np.ndarray) -> Optional[np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -350,16 +314,14 @@ def _rect_points(
     image_shape: tuple[int, int],
     bbox_xyxy: tuple[int, int, int, int],
 ) -> np.ndarray:
-    points = _obb_points(result, index)
+    points = obb_points(result, index, image_shape)
     if points is not None:
         return points
 
     masks = getattr(result, "masks", None)
-    boxes = getattr(result, "boxes", None)
-    if masks is not None and boxes is not None and len(masks.data) == len(boxes):
-        mask = masks.data[index].cpu().numpy()
-        mask = cv2.resize(mask, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
-        rect = _rect_from_mask((mask > 0.5).astype(np.uint8))
+    if masks is not None and getattr(masks, "data", None) is not None:
+        mask = detection_mask(result, index, image_shape, bbox_xyxy)
+        rect = _rect_from_mask(mask)
         if rect is not None:
             return rect
 
@@ -367,18 +329,17 @@ def _rect_points(
     return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
 
 
-def _depth_mask(result: Any, index: int, image_shape: tuple[int, int], rect_points: np.ndarray) -> np.ndarray:
+def _depth_mask(
+    result: Any,
+    index: int,
+    image_shape: tuple[int, int],
+    rect_points: np.ndarray,
+    bbox_xyxy: tuple[int, int, int, int],
+) -> np.ndarray:
     masks = getattr(result, "masks", None)
-    boxes = getattr(result, "boxes", None)
-    if masks is not None and boxes is not None and len(masks.data) == len(boxes):
-        mask = masks.data[index].cpu().numpy()
-        mask = cv2.resize(mask, (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
-        return (mask > 0.5).astype(np.uint8)
-
-    polygon = np.round(rect_points).astype(np.int32)
-    mask = np.zeros(image_shape, dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon], 1)
-    return mask
+    if masks is not None and getattr(masks, "data", None) is not None:
+        return detection_mask(result, index, image_shape, bbox_xyxy)
+    return detection_polygon_mask(rect_points, image_shape)
 
 
 def _short_edge(rect_points: np.ndarray) -> tuple[np.ndarray, float]:

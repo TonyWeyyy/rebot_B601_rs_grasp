@@ -1,20 +1,20 @@
 """
-Place banana into box demo based on YOLO.
+Parameterized OBB pick-and-place demo based on YOLO.
 
 Workflow:
-  1. Detect banana and box
-  2. Go to grasp banana (don't open gripper before placing)
-  3. Grasp banana and lift to ready position
-  4. Place into box (release gripper)
-  5. Return to ready position
+  1. Detect target object and container in the same RGB-D frame
+  2. Grasp target and lift safely to ready position
+  3. Move to pre-place -> release pose above container, release, retract vertically
+  4. Return to ready position
 
 Keys:
-  G: capture and execute place
+  G: capture and execute pick-and-place
   R: resume live preview
-  Q/Esc: release gripper, home, and exit
+  Q/Esc: exit (releases gripper and homes in real mode; zero motion in --dry-run)
 
 Usage:
     python scripts/set.py
+    python scripts/set.py --target-keywords toy,red --container-keywords box,container --place-height 0.15
     python scripts/set.py --dry-run
 """
 
@@ -22,203 +22,129 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
-import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import cv2
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_ROOT_STR = str(PROJECT_ROOT)
-if PROJECT_ROOT_STR not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT_STR)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from drivers.camera import make_camera
-from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
-from reBotArm_control_py.actuator import RebotArm
-from reBotArm_control_py.controllers import RebotArmEndPose
-from utils.camera_utils import compose_cam_to_base_transform, load_config, load_hand_eye
-from utils.ordinary_grasp import GraspPose, estimate_grasps
-from utils.transforms import transform_grasp_pose_to_base
-from utils.yolo_utils import load_yolo
-
-
-def _wait_motion(controller: RebotArmEndPose, duration: float, extra: float = 0.6) -> None:
-    thread = getattr(controller, "_send_thread", None)
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=duration + extra + 2.0)
-    else:
-        time.sleep(duration + extra)
+from core.preview_app import FpsMeter  # noqa: E402
+from core.robot_session import RobotSession, execute_pick_and_place_sequence  # noqa: E402
+from drivers.camera import make_camera  # noqa: E402
+from utils.camera_utils import compose_cam_to_base_transform, load_config, load_hand_eye  # noqa: E402
+from utils.ordinary_grasp import GraspPose, estimate_grasps  # noqa: E402
+from utils.target_selector import select_by_keywords  # noqa: E402
+from utils.transforms import transform_grasp_pose_to_base_with_retreat  # noqa: E402
+from utils.yolo_utils import load_yolo  # noqa: E402
 
 
-def _move_ready(controller: RebotArmEndPose, ready_cfg: dict[str, Any]) -> None:
-    duration = float(ready_cfg.get("duration", 3.0))
-    controller.move_to_traj(
-        x=float(ready_cfg.get("x", 0.25)),
-        y=float(ready_cfg.get("y", 0.0)),
-        z=float(ready_cfg.get("z", 0.35)),
-        roll=float(ready_cfg.get("roll", 0.0)),
-        pitch=float(ready_cfg.get("pitch", 1.2)),
-        yaw=float(ready_cfg.get("yaw", 0.0)),
-        duration=duration,
-    )
-    _wait_motion(controller, duration)
-
-
-def _cam_to_base(T_hand_eye: np.ndarray, grasp_driver: GraspDriver, cfg: dict[str, Any]) -> np.ndarray:
-    return compose_cam_to_base_transform(grasp_driver.get_tcp_pose(), T_hand_eye, cfg)
-
-
-def _execute_place_sequence(
-    controller: RebotArmEndPose,
-    grasp_driver: GraspDriver,
-    grasp6d: tuple[float, ...],
-    pre6d: tuple[float, ...],
-    box_center: np.ndarray,
-    ready_cfg: dict[str, Any],
-    dry_run: bool,
-) -> bool:
-    """Execute the complete place sequence: grasp -> lift -> place -> return."""
-    xg, yg, zg, rxg, ryg, rzg = grasp6d
-    xp, yp, zp, rxp, ryp, rzp = pre6d
-
-    print(f"[Step2] pregrasp  xyz=({xp:+.3f},{yp:+.3f},{zp:+.3f})  rpy=({rxp:+.3f},{ryp:+.3f},{rzp:+.3f})")
-    print(f"[Step2] grasp     xyz=({xg:+.3f},{yg:+.3f},{zg:+.3f})  rpy=({rxg:+.3f},{ryg:+.3f},{rzg:+.3f})")
-
-    if dry_run:
-        print("[Step2] dry run; skip motion")
-        return True
-
-    print("[Step2] Open gripper")
-    grasp_driver.open_gripper()
-
-    print("[Step2] Move to pregrasp")
-    if not controller.move_to_traj(xp, yp, zp, rxp, ryp, rzp, duration=2.0):
-        print("[Step2] Pregrasp IK failed")
-        return False
-    _wait_motion(controller, 2.0)
-
-    print("[Step2] Move to grasp")
-    if not controller.move_to_traj(xg, yg, zg, rxg, ryg, rzg, duration=1.5):
-        print("[Step2] Grasp IK failed")
-        return False
-    _wait_motion(controller, 1.5)
-
-    print("[Step2] Closing gripper")
-    ok = grasp_driver.grasp()
-    print("[Step2] Holding object" if ok else "[Step2] Empty grasp")
-    if not ok:
-        return False
-
-    print("[Step3] Lift to ready position with banana")
-    _move_ready(controller, ready_cfg)
-
-    print(f"[Step4] Move to box center: xyz=({box_center[0]:+.3f},{box_center[1]:+.3f},{box_center[2]:+.3f})")
-    roll, pitch, yaw = 0.0, 1.2, 0.0
-    if not controller.move_to_traj(box_center[0], box_center[1], box_center[2], roll, pitch, yaw, duration=2.0):
-        print("[Step4] Place position IK failed")
-        return False
-    _wait_motion(controller, 2.0)
-
-    print("[Step4] Release gripper - banana falls into box")
-    grasp_driver.open_gripper(timeout=0.5)
-
-    def _close_gripper():
-        time.sleep(0.8)
-        d = 0.0
-        raw_target = (d / grasp_driver.MAX_DISTANCE_M) * grasp_driver._angle_open
-        target = float(np.clip(raw_target, grasp_driver._open_lo, grasp_driver._open_hi))
-        with grasp_driver._state_lock:
-            grasp_driver._target_pos = target
-            grasp_driver._state = grasp_driver._STATE_POSITION
-            grasp_driver._position_reached = False
-
-    close_thread = threading.Thread(target=_close_gripper)
-    close_thread.start()
-
-    print("[Step5] Return to ready position")
-    _move_ready(controller, ready_cfg)
-    close_thread.join()
-
-    return True
+def _parse_keywords(raw: str) -> tuple[str, ...]:
+    return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
 
 
 def _render_display(
     image: np.ndarray,
     grasps: list[GraspPose],
-    best_banana: Optional[GraspPose],
-    best_box: Optional[GraspPose],
+    best_target: Optional[GraspPose],
+    best_container: Optional[GraspPose],
     status_text: str,
 ) -> np.ndarray:
     display = image.copy()
     for grasp in grasps:
         color = (0, 255, 0) if grasp.is_valid else (0, 165, 255)
-        cv2.rectangle(display, 
-                      (int(grasp.bbox_xyxy[0]), int(grasp.bbox_xyxy[1])),
-                      (int(grasp.bbox_xyxy[2]), int(grasp.bbox_xyxy[3])), 
-                      color, 2)
-        cv2.putText(display, f"{grasp.class_name} {grasp.conf:.2f}", 
-                    (int(grasp.bbox_xyxy[0]), int(grasp.bbox_xyxy[1]) - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        x1, y1, x2, y2 = [int(v) for v in grasp.bbox_xyxy]
+        cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            display,
+            f"{grasp.class_name} {grasp.conf:.2f}",
+            (x1, max(16, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+        )
 
     cv2.putText(display, status_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-    
-    if best_banana is not None:
-        x_m, y_m, z_m = best_banana.position.tolist()
-        cv2.putText(display, f"banana: xyz=({x_m:+.3f},{y_m:+.3f},{z_m:+.3f})",
-                    (10, display.shape[0] - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 255, 140), 2)
-    
-    if best_box is not None:
-        x_m, y_m, z_m = best_box.position.tolist()
-        cv2.putText(display, f"box: xyz=({x_m:+.3f},{y_m:+.3f},{z_m:+.3f})",
-                    (10, display.shape[0] - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 120), 2)
-    
+
+    if best_target is not None:
+        x_m, y_m, z_m = best_target.position.tolist()
+        cv2.putText(
+            display,
+            f"target({best_target.class_name}): xyz=({x_m:+.3f},{y_m:+.3f},{z_m:+.3f})",
+            (10, display.shape[0] - 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (120, 255, 140),
+            2,
+        )
+
+    if best_container is not None:
+        x_m, y_m, z_m = best_container.position.tolist()
+        cv2.putText(
+            display,
+            f"container({best_container.class_name}): xyz=({x_m:+.3f},{y_m:+.3f},{z_m:+.3f})",
+            (10, display.shape[0] - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 200, 120),
+            2,
+        )
+
     return display
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Place banana into box demo")
+def parse_args(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    default_target_keywords: str = "banana",
+    default_container_keywords: str = "box",
+    default_place_height: float = 0.08,
+    window_title: str = "Set - OBB Pick and Place",
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=window_title)
     parser.add_argument("--config", default="config/default.yaml")
-    parser.add_argument("--dry-run", action="store_true", help="estimate only; do not move the arm")
-    return parser.parse_args()
+    parser.add_argument("--target-keywords", default=default_target_keywords, help="comma-separated target keywords")
+    parser.add_argument("--container-keywords", default=default_container_keywords, help="comma-separated container keywords")
+    parser.add_argument("--place-height", type=float, default=default_place_height, help="TCP release Z in base frame (m)")
+    parser.add_argument("--dry-run", action="store_true", help="estimate only; never move arm or gripper")
+    parser.add_argument("--move-ready", action="store_true", help="with --dry-run, move only to ready at startup")
+    parser.add_argument("--confirm-motion", action="store_true", help="require YES / PLACE confirmation")
+    args = parser.parse_args(argv)
+    args.window_title = window_title
+    return args
 
 
-def main() -> int:
-    args = parse_args()
-    cfg = load_config(PROJECT_ROOT / args.config)
+def run_obb_place(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
+    cfg = load_config(config_path)
 
-    robot_cfg = cfg.get("robot", {})
-    ready_cfg = robot_cfg.get(
-        "ready_pose",
-        {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
-    )
+    target_keywords = _parse_keywords(args.target_keywords)
+    container_keywords = _parse_keywords(args.container_keywords)
+
     cam_cfg = cfg.get("camera", {})
     print(f"=== Camera: {cam_cfg.get('type')} ===")
+    print(f"=== Target keywords: {target_keywords} | Container keywords: {container_keywords} ===")
     cam = make_camera(cfg)
+    robot = RobotSession(cfg, dry_run=args.dry_run, move_ready_in_dry_run=args.move_ready, init_ik=False)
 
     last_results: list[Any] = []
     last_grasps: list[GraspPose] = []
     frozen = False
     last_display: Optional[np.ndarray] = None
     frame_index = 0
-    fps_counter = 0
-    fps_timer = time.perf_counter()
-    fps_value = 0.0
+    fps_meter = FpsMeter()
 
-    window_name = "Set - Place Banana into Box"
+    window_name = args.window_title
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     print("\n[Keys]  G=place  R=resume  Q/ESC=quit\n")
 
-    controller: Optional[RebotArmEndPose] = None
-    rebotarm: Optional[RebotArm] = None
-    grasp_driver: Optional[GraspDriver] = None
     T_hand_eye: Optional[np.ndarray] = None
-    yolo_opts: dict[str, Any] = {}
-    robot_ready = False
 
     try:
         cam.open()
@@ -231,34 +157,24 @@ def main() -> int:
             print("[WARN] Hand-eye calibration unavailable; grasp execution disabled")
             T_hand_eye = None
 
-        yolo_cfg = cfg.get("yolo", {})
         gp_cfg = cfg.get("grasp_pipeline", {})
         grasp_cfg = gp_cfg.get("grasp", {})
+        place_cfg = dict(cfg.get("place", {}))
+        place_cfg["height_m"] = float(args.place_height)
 
-        model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
         pregrasp_offset_m = float(grasp_cfg.get("pregrasp_offset_m", 0.08))
+        retreat_offset_m = float(grasp_cfg.get("retreat_offset_m", pregrasp_offset_m))
+        pre_place_offset_m = float(place_cfg.get("pre_place_offset_m", 0.08))
+        place_rpy = place_cfg.get("orientation_rpy", [0.0, 1.2, 0.0])
         depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
+        approach_mode = str(grasp_cfg.get("ordinary_approach_mode", "camera_z"))
+        fusion_frames = max(1, int(grasp_cfg.get("depth_fusion_frames", 3)))
         infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
 
-        print(f"=== Load YOLO: {model_name} ===")
         model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
 
         print("=== Init robot ===")
-        selected = selected_arm_config(robot_cfg.get("repo_root"))
-        rebotarm = RebotArm()
-        controller = RebotArmEndPose(rebotarm, arm_control_mode=selected.controller_mode)
-        grasp_driver = GraspDriver(
-            rebotarm,
-            controller,
-            gripper_config=robot_cfg.get("gripper"),
-            repo_root=robot_cfg.get("repo_root"),
-        )
-        grasp_driver.start()
-        robot_ready = True
-        print(f"[Robot] mode: {selected.controller_mode}")
-
-        print("[Robot] Move ready")
-        _move_ready(controller, ready_cfg)
+        robot.start()
 
         while True:
             color_bgr, depth_mm = cam.get_frame()
@@ -266,12 +182,7 @@ def main() -> int:
                 continue
 
             frame_index += 1
-            fps_counter += 1
-            now = time.perf_counter()
-            if now - fps_timer >= 1.0:
-                fps_value = fps_counter / (now - fps_timer)
-                fps_counter = 0
-                fps_timer = now
+            fps_value = fps_meter.tick()
 
             if not frozen and (frame_index % infer_every == 0 or not last_results):
                 last_results = model.predict(
@@ -281,26 +192,23 @@ def main() -> int:
                     conf=float(yolo_opts.get("conf", 0.25)),
                     iou=float(yolo_opts.get("iou", 0.45)),
                 )
-                last_grasps = estimate_grasps(last_results, depth_mm, K, depth_quantile=depth_quantile)
+                last_grasps = estimate_grasps(
+                    last_results,
+                    depth_mm,
+                    K,
+                    depth_quantile=depth_quantile,
+                    approach_mode=approach_mode,
+                )
 
-            best_banana = None
-            best_box = None
-            for grasp in last_grasps:
-                if not grasp.is_valid:
-                    continue
-                if "banana" in grasp.class_name.lower():
-                    if best_banana is None or grasp.conf > best_banana.conf:
-                        best_banana = grasp
-                elif "box" in grasp.class_name.lower():
-                    if best_box is None or grasp.conf > best_box.conf:
-                        best_box = grasp
+            best_target = select_by_keywords(last_grasps, target_keywords)
+            best_container = select_by_keywords(last_grasps, container_keywords, exclude=best_target)
 
             status = f"{'FROZEN' if frozen else 'LIVE'} {fps_value:.1f}fps | G=place R=resume Q=quit"
             if frozen and last_display is not None:
                 display = last_display.copy()
                 cv2.putText(display, "[FROZEN]", (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 215, 255), 2)
             else:
-                display = _render_display(color_bgr, last_grasps, best_banana, best_box, status)
+                display = _render_display(color_bgr, last_grasps, best_target, best_container, status)
 
             cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
@@ -314,12 +222,17 @@ def main() -> int:
                 continue
 
             if key in (ord("g"), ord("G")):
-                print("\n[G] Capture and execute place")
-                print("[Step1] Detect banana and box")
-                snap_color, snap_depth = cam.get_frame()
+                print(f"\n[G] Capture ({fusion_frames} frames) and execute pick-and-place")
+                snap_color, snap_depth = cam.get_fused_frame(fusion_frames)
                 if snap_color is None or snap_depth is None:
                     print("[G] Frame capture failed")
                     continue
+
+                T_cam2base = (
+                    compose_cam_to_base_transform(robot.get_tcp_pose(), T_hand_eye, cfg)
+                    if T_hand_eye is not None
+                    else None
+                )
 
                 snap_results = model.predict(
                     snap_color,
@@ -328,87 +241,76 @@ def main() -> int:
                     conf=float(yolo_opts.get("conf", 0.25)),
                     iou=float(yolo_opts.get("iou", 0.45)),
                 )
-                snap_grasps = estimate_grasps(snap_results, snap_depth, K, depth_quantile=depth_quantile)
+                snap_grasps = estimate_grasps(
+                    snap_results,
+                    snap_depth,
+                    K,
+                    depth_quantile=depth_quantile,
+                    approach_mode=approach_mode,
+                )
 
-                snap_banana = None
-                snap_box = None
-                for grasp in snap_grasps:
-                    if not grasp.is_valid:
-                        continue
-                    if "banana" in grasp.class_name.lower():
-                        if snap_banana is None or grasp.conf > snap_banana.conf:
-                            snap_banana = grasp
-                    elif "box" in grasp.class_name.lower():
-                        if snap_box is None or grasp.conf > snap_box.conf:
-                            snap_box = grasp
+                snap_target = select_by_keywords(snap_grasps, target_keywords)
+                snap_container = select_by_keywords(snap_grasps, container_keywords, exclude=snap_target)
 
-                if snap_banana is None:
-                    print("[G] No valid banana detected")
+                if snap_target is None:
+                    print("[G] No valid target detected")
                     continue
-                if snap_box is None:
-                    print("[G] No valid box detected")
+                if snap_container is None:
+                    print("[G] No valid container detected")
                     continue
 
-                print(f"\n[G] Banana: class={snap_banana.class_name} conf={snap_banana.conf:.3f}")
-                print(f"  position_xyz={snap_banana.position.tolist()}")
-                print(f"\n[G] Box: class={snap_box.class_name} conf={snap_box.conf:.3f}")
-                print(f"  position_xyz={snap_box.position.tolist()}")
+                print(f"\n[G] Target: class={snap_target.class_name} conf={snap_target.conf:.3f} xyz={snap_target.position.tolist()}")
+                print(f"[G] Container: class={snap_container.class_name} conf={snap_container.conf:.3f} xyz={snap_container.position.tolist()}")
 
-                snap_display = _render_display(snap_color, snap_grasps, snap_banana, snap_box, "SNAPSHOT")
+                snap_display = _render_display(snap_color, snap_grasps, snap_target, snap_container, "SNAPSHOT")
                 frozen = True
                 last_display = snap_display
                 last_results = snap_results
                 last_grasps = snap_grasps
 
-                if T_hand_eye is None:
+                if T_cam2base is None:
                     print("[G] Hand-eye calibration unavailable")
                     continue
 
-                T_cam2base = _cam_to_base(T_hand_eye, grasp_driver, cfg)
-
-                grasp6d, pre6d = transform_grasp_pose_to_base(
-                    snap_banana.position,
-                    snap_banana.tcp_rotation,
+                grasp6d, pre6d, retreat6d = transform_grasp_pose_to_base_with_retreat(
+                    snap_target.position,
+                    snap_target.tcp_rotation,
                     T_cam2base,
                     pregrasp_offset_m,
+                    retreat_offset_m,
+                )
+                container_base = T_cam2base @ np.append(np.asarray(snap_container.position, dtype=np.float64), 1.0)
+                place_z = float(args.place_height)
+                roll, pitch, yaw = [float(v) for v in place_rpy]
+                place6d = (float(container_base[0]), float(container_base[1]), place_z, roll, pitch, yaw)
+                pre_place6d = (
+                    float(container_base[0]),
+                    float(container_base[1]),
+                    place_z + pre_place_offset_m,
+                    roll,
+                    pitch,
+                    yaw,
                 )
 
-                pos = snap_box.position
-                box_homogeneous = np.array([float(pos[0]), float(pos[1]), float(pos[2]), 1.0])
-                box_base = T_cam2base @ box_homogeneous
-                box_center_base = np.array([float(box_base[0]), float(box_base[1]), 0.08])
-
-                ok = _execute_place_sequence(
-                    controller, 
-                    grasp_driver, 
-                    grasp6d, 
+                ok = execute_pick_and_place_sequence(
+                    robot.controller,
+                    robot.grasp_driver,
+                    grasp6d,
                     pre6d,
-                    box_center_base,
-                    ready_cfg,
+                    retreat6d,
+                    pre_place6d,
+                    place6d,
+                    robot.ready_cfg,
+                    place_cfg,
                     dry_run=args.dry_run,
+                    confirm_motion=args.confirm_motion,
+                    arm=robot.arm,
+                    n_joints=robot.n_joints,
                 )
-                
-                if ok:
-                    print("[G] Place completed successfully!")
-                else:
-                    print("[G] Place failed")
-                
-                _move_ready(controller, ready_cfg)
+                print("[G] Place completed successfully!" if ok else "[G] Place stopped/failed")
 
     finally:
-        print("\n[Exit] Release gripper and home")
-        try:
-            if robot_ready and grasp_driver is not None and controller is not None and getattr(controller, "_running", False):
-                grasp_driver.release_gripper()
-        except Exception as exc:
-            print(f"[Exit] {exc}")
-        try:
-            if controller is not None and getattr(controller, "_running", False):
-                controller.end()
-            elif rebotarm is not None:
-                rebotarm.disconnect()
-        except Exception as exc:
-            print(f"[Exit] {exc}")
+        robot.close()
         try:
             cam.close()
         except Exception:
@@ -417,6 +319,10 @@ def main() -> int:
         print("Done.")
 
     return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    return run_obb_place(parse_args(argv))
 
 
 if __name__ == "__main__":

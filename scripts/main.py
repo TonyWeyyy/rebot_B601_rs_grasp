@@ -4,18 +4,18 @@ Ordinary visual grasping demo based on YOLO.
 Keys:
   G: capture the current RGB-D frame and execute the best grasp.
   R: resume live preview.
-  Q/Esc: release, home, and exit.
+  Q/Esc: exit (releases gripper and homes in real mode; zero motion in --dry-run).
 
 Usage:
     python scripts/main.py
     python scripts/main.py --dry-run
+    python scripts/main.py --dry-run --move-ready
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -23,90 +23,20 @@ import cv2
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_ROOT_STR = str(PROJECT_ROOT)
-if PROJECT_ROOT_STR not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT_STR)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from drivers.camera import make_camera
-from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
-from reBotArm_control_py.actuator import RebotArm
-from reBotArm_control_py.controllers import RebotArmEndPose
-from utils.camera_utils import compose_cam_to_base_transform, load_config, load_hand_eye
-from utils.ordinary_grasp import GraspPose, draw_grasp, estimate_grasps, select_best_grasp
-from utils.transforms import (
+from core.preview_app import FpsMeter  # noqa: E402
+from core.robot_session import RobotSession, execute_grasp_sequence  # noqa: E402
+from drivers.camera import make_camera  # noqa: E402
+from utils.camera_utils import compose_cam_to_base_transform, load_config, load_hand_eye  # noqa: E402
+from utils.ordinary_grasp import GraspPose, draw_grasp, estimate_grasps, select_best_grasp  # noqa: E402
+from utils.transforms import (  # noqa: E402
     canonicalize_parallel_gripper_tcp_rotation,
     rotation_matrix_to_euler_zyx,
-    transform_grasp_pose_to_base,
+    transform_grasp_pose_to_base_with_retreat,
 )
-from utils.yolo_utils import load_yolo
-
-
-def _wait_motion(controller: RebotArmEndPose, duration: float, extra: float = 0.6) -> None:
-    thread = getattr(controller, "_send_thread", None)
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=duration + extra + 2.0)
-    else:
-        time.sleep(duration + extra)
-
-
-def _move_ready(controller: RebotArmEndPose, ready_cfg: dict[str, Any]) -> None:
-    duration = float(ready_cfg.get("duration", 3.0))
-    controller.move_to_traj(
-        x=float(ready_cfg.get("x", 0.25)),
-        y=float(ready_cfg.get("y", 0.0)),
-        z=float(ready_cfg.get("z", 0.35)),
-        roll=float(ready_cfg.get("roll", 0.0)),
-        pitch=float(ready_cfg.get("pitch", 1.2)),
-        yaw=float(ready_cfg.get("yaw", 0.0)),
-        duration=duration,
-    )
-    _wait_motion(controller, duration)
-
-
-def _cam_to_base(T_hand_eye: np.ndarray, grasp_driver: GraspDriver, cfg: dict[str, Any]) -> np.ndarray:
-    return compose_cam_to_base_transform(grasp_driver.get_tcp_pose(), T_hand_eye, cfg)
-
-
-def _execute_grasp(
-    controller: RebotArmEndPose,
-    grasp_driver: GraspDriver,
-    grasp6d: tuple[float, ...],
-    pre6d: tuple[float, ...],
-    ready_cfg: dict[str, Any],
-    dry_run: bool,
-) -> bool:
-    xg, yg, zg, rxg, ryg, rzg = grasp6d
-    xp, yp, zp, rxp, ryp, rzp = pre6d
-
-    print(f"[Grasp] pregrasp  xyz=({xp:+.3f},{yp:+.3f},{zp:+.3f})  rpy=({rxp:+.3f},{ryp:+.3f},{rzp:+.3f})")
-    print(f"[Grasp] grasp     xyz=({xg:+.3f},{yg:+.3f},{zg:+.3f})  rpy=({rxg:+.3f},{ryg:+.3f},{rzg:+.3f})")
-
-    if dry_run:
-        print("[Grasp] dry run; skip motion")
-        return False
-
-    print("[Grasp] Open gripper")
-    grasp_driver.open_gripper()
-
-    print("[Grasp] Move to pregrasp")
-    if not controller.move_to_traj(xp, yp, zp, rxp, ryp, rzp, duration=2.0):
-        print("[Grasp] Pregrasp IK failed")
-        return False
-    _wait_motion(controller, 2.0)
-
-    print("[Grasp] Move to grasp")
-    if not controller.move_to_traj(xg, yg, zg, rxg, ryg, rzg, duration=1.5):
-        print("[Grasp] Grasp IK failed")
-        return False
-    _wait_motion(controller, 1.5)
-
-    print("[Grasp] Closing")
-    ok = grasp_driver.grasp()
-    print("[Grasp] Holding object" if ok else "[Grasp] Empty grasp")
-
-    print("[Grasp] Return ready")
-    _move_ready(controller, ready_cfg)
-    return ok
+from utils.yolo_utils import load_yolo  # noqa: E402
 
 
 def _render_display(
@@ -152,42 +82,36 @@ def _print_best_grasp(grasp: GraspPose) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ordinary short-axis grasp demo")
     parser.add_argument("--config", default="config/default.yaml")
-    parser.add_argument("--dry-run", action="store_true", help="estimate only; do not move the arm")
+    parser.add_argument("--dry-run", action="store_true", help="estimate only; never move the arm or gripper")
+    parser.add_argument("--move-ready", action="store_true", help="with --dry-run, move only to ready at startup")
+    parser.add_argument("--confirm-motion", action="store_true", help="require typing YES before motion")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    cfg = load_config(PROJECT_ROOT / args.config)
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
+    cfg = load_config(config_path)
 
-    robot_cfg = cfg.get("robot", {})
-    ready_cfg = robot_cfg.get(
-        "ready_pose",
-        {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
-    )
     cam_cfg = cfg.get("camera", {})
     print(f"=== Camera: {cam_cfg.get('type')} ===")
     cam = make_camera(cfg)
+    robot = RobotSession(cfg, dry_run=args.dry_run, move_ready_in_dry_run=args.move_ready, init_ik=False)
 
     last_results: list[Any] = []
     last_grasps: list[GraspPose] = []
     frozen = False
     last_display: Optional[np.ndarray] = None
     frame_index = 0
-    fps_counter = 0
-    fps_timer = time.perf_counter()
-    fps_value = 0.0
+    fps_meter = FpsMeter()
 
     window_name = "Main - Ordinary Grasp"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     print("\n[Keys]  G=grasp  R=resume  Q/ESC=quit\n")
 
-    controller: Optional[RebotArmEndPose] = None
-    rebotarm: Optional[RebotArm] = None
-    grasp_driver: Optional[GraspDriver] = None
     T_hand_eye: Optional[np.ndarray] = None
-    yolo_opts: dict[str, Any] = {}
-    robot_ready = False
 
     try:
         cam.open()
@@ -200,34 +124,19 @@ def main() -> int:
             print("[WARN] Hand-eye calibration unavailable; grasp execution disabled")
             T_hand_eye = None
 
-        yolo_cfg = cfg.get("yolo", {})
         gp_cfg = cfg.get("grasp_pipeline", {})
         grasp_cfg = gp_cfg.get("grasp", {})
-
-        model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
         pregrasp_offset_m = float(grasp_cfg.get("pregrasp_offset_m", 0.08))
+        retreat_offset_m = float(grasp_cfg.get("retreat_offset_m", pregrasp_offset_m))
         depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
+        approach_mode = str(grasp_cfg.get("ordinary_approach_mode", "camera_z"))
+        fusion_frames = max(1, int(grasp_cfg.get("depth_fusion_frames", 3)))
         infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
 
-        print(f"=== Load YOLO: {model_name} ===")
         model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
 
         print("=== Init robot ===")
-        selected = selected_arm_config(robot_cfg.get("repo_root"))
-        rebotarm = RebotArm()
-        controller = RebotArmEndPose(rebotarm, arm_control_mode=selected.controller_mode)
-        grasp_driver = GraspDriver(
-            rebotarm,
-            controller,
-            gripper_config=robot_cfg.get("gripper"),
-            repo_root=robot_cfg.get("repo_root"),
-        )
-        grasp_driver.start()
-        robot_ready = True
-        print(f"[Robot] mode: {selected.controller_mode}")
-
-        print("[Robot] Move ready")
-        _move_ready(controller, ready_cfg)
+        robot.start()
 
         while True:
             color_bgr, depth_mm = cam.get_frame()
@@ -235,12 +144,7 @@ def main() -> int:
                 continue
 
             frame_index += 1
-            fps_counter += 1
-            now = time.perf_counter()
-            if now - fps_timer >= 1.0:
-                fps_value = fps_counter / (now - fps_timer)
-                fps_counter = 0
-                fps_timer = now
+            fps_value = fps_meter.tick()
 
             if not frozen and (frame_index % infer_every == 0 or not last_results):
                 last_results = model.predict(
@@ -250,7 +154,13 @@ def main() -> int:
                     conf=float(yolo_opts.get("conf", 0.25)),
                     iou=float(yolo_opts.get("iou", 0.45)),
                 )
-                last_grasps = estimate_grasps(last_results, depth_mm, K, depth_quantile=depth_quantile)
+                last_grasps = estimate_grasps(
+                    last_results,
+                    depth_mm,
+                    K,
+                    depth_quantile=depth_quantile,
+                    approach_mode=approach_mode,
+                )
 
             status = f"{'FROZEN' if frozen else 'LIVE'} {fps_value:.1f}fps | G=grasp R=resume Q=quit"
             best_live = select_best_grasp(last_grasps)
@@ -272,11 +182,18 @@ def main() -> int:
                 continue
 
             if key in (ord("g"), ord("G")):
-                print("\n[G] Capture and estimate grasp")
-                snap_color, snap_depth = cam.get_frame()
+                print(f"\n[G] Capture ({fusion_frames} frames) and estimate grasp")
+                snap_color, snap_depth = cam.get_fused_frame(fusion_frames)
                 if snap_color is None or snap_depth is None:
                     print("[G] Frame capture failed")
                     continue
+
+                # Freeze TCP pose at capture time before YOLO inference.
+                T_cam2base = (
+                    compose_cam_to_base_transform(robot.get_tcp_pose(), T_hand_eye, cfg)
+                    if T_hand_eye is not None
+                    else None
+                )
 
                 snap_results = model.predict(
                     snap_color,
@@ -285,7 +202,13 @@ def main() -> int:
                     conf=float(yolo_opts.get("conf", 0.25)),
                     iou=float(yolo_opts.get("iou", 0.45)),
                 )
-                snap_grasps = estimate_grasps(snap_results, snap_depth, K, depth_quantile=depth_quantile)
+                snap_grasps = estimate_grasps(
+                    snap_results,
+                    snap_depth,
+                    K,
+                    depth_quantile=depth_quantile,
+                    approach_mode=approach_mode,
+                )
                 best = select_best_grasp(snap_grasps)
                 if best is None:
                     print("[G] No valid grasp")
@@ -299,33 +222,33 @@ def main() -> int:
                 last_results = snap_results
                 last_grasps = snap_grasps
 
-                if T_hand_eye is None:
+                if T_cam2base is None:
                     print("[G] Hand-eye calibration unavailable")
                     continue
 
-                T_cam2base = _cam_to_base(T_hand_eye, grasp_driver, cfg)
-                grasp6d, pre6d = transform_grasp_pose_to_base(
+                grasp6d, pre6d, retreat6d = transform_grasp_pose_to_base_with_retreat(
                     best.position,
                     best.tcp_rotation,
                     T_cam2base,
                     pregrasp_offset_m,
+                    retreat_offset_m,
                 )
-                _execute_grasp(controller, grasp_driver, grasp6d, pre6d, ready_cfg, dry_run=args.dry_run)
+                execute_grasp_sequence(
+                    robot.controller,
+                    robot.grasp_driver,
+                    grasp6d,
+                    pre6d,
+                    retreat6d,
+                    robot.ready_cfg,
+                    motion_cfg=grasp_cfg,
+                    dry_run=args.dry_run,
+                    confirm_motion=args.confirm_motion,
+                    arm=robot.arm,
+                    n_joints=robot.n_joints,
+                )
 
     finally:
-        print("\n[Exit] Release gripper and home")
-        try:
-            if robot_ready and grasp_driver is not None and controller is not None and getattr(controller, "_running", False):
-                grasp_driver.release_gripper()
-        except Exception as exc:
-            print(f"[Exit] {exc}")
-        try:
-            if controller is not None and getattr(controller, "_running", False):
-                controller.end()
-            elif rebotarm is not None:
-                rebotarm.disconnect()
-        except Exception as exc:
-            print(f"[Exit] {exc}")
+        robot.close()
         try:
             cam.close()
         except Exception:

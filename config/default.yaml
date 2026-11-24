@@ -29,20 +29,34 @@ robot:
       tau_max: 1.5
       close_torque: 1.0
       default_force: 0.30
+      post_contact_close_angle: 0.0
+      hard_stop_angle: 0.05
+      stall_vel: 0.05
+      contact_torque_ratio: 0.45
+      post_contact_timeout_s: 0.30
+      debug: false
     rs:
       angle_open: 5.0
       counterclockwise: false
       tau_max: 1.5
-      # close_torque: 1.5
       close_torque: 1.5
       default_force: 0.8
-      post_contact_close_angle: 0.2    # 首次接触后额外闭合 0.12 rad，是本次保守初值。允许范围：0.0～0.30 rad。超出范围会在初始化时直接报错，不会静默放大
+      # 首次接触后额外闭合 0.20 rad；允许范围：0.0～0.30 rad，超出范围会在初始化时直接报错。
+      post_contact_close_angle: 0.20
+      # 实测（RS + 柔性夹爪）：空夹机械限位在 pos≈-0.75，留 0.10 rad 余量。
+      hard_stop_angle: -0.65
+      stall_vel: 0.20
+      # 接触扭矩阈值 = contact_torque_ratio * |close_torque|（若 close_torque 降到 0.6，建议改回 0.45）
+      contact_torque_ratio: 0.35
+      post_contact_timeout_s: 0.30
+      debug: false
   ready_pose:
     x: 0.3
     y: 0.0
     z: 0.3
     roll: 0.0
     pitch: 0.7
+    yaw: 0.0
     duration: 3.0
 
 yolo:
@@ -75,13 +89,22 @@ grasp_pipeline:
     # 可选 graspnet / anygrasp；命令行 --estimator 可覆盖此值。
     estimator: anygrasp
     depth_quantile: 0.5
+    # 触发规划时连续采集多帧做非零深度中值融合，抑制瞬时噪点与空洞（1=禁用融合）
+    depth_fusion_frames: 3
     pregrasp_offset_m: 0.080
-    # insertion_depth_m: 0.015
     insertion_depth_m: 0.02
     min_base_z_m: 0.01
+    # 候选 IK 预检上限与轨迹时长
+    max_ik_candidates: 20
+    # 普通 OBB 抓取进给方向：camera_z（沿光轴/桌面垂直，避免视野边缘透视倾斜）或 ray（沿射线）
+    ordinary_approach_mode: "camera_z"
+    pregrasp_duration_s: 2.5
+    grasp_duration_s: 2.0
+    retreat_duration_s: 2.0
+    ready_duration_s: 3.0
 
 graspnet:
-  checkpoint: "/home/tony/wey/rebot_developer/rebot_grasp/sdk/graspnet-baseline/checkpoints/checkpoint-rs.tar"
+  checkpoint: "sdk/graspnet-baseline/checkpoints/checkpoint-rs.tar"
   num_point: 20000
   collision_thresh: 0.01
   min_depth: 0.05
@@ -91,11 +114,10 @@ graspnet:
   target_margin_px: 12
   target_expand_ratio: 1.35
 
-
 # AnyGrasp（2026-07 之后的新版 SDK：create_detector + steering 参数）
 # 权重、gsnet.so 和本机 license 不随源码分发，安装步骤见 AnyGrasp升级操作手册.md。
 anygrasp:
-  sdk_root: "/home/tony/wey/rebot_developer/rebot_grasp/sdk/anygrasp_sdk"
+  sdk_root: "sdk/anygrasp_sdk"
   checkpoint: "log/checkpoint_detection.tar"  # 相对于 grasp_detection/
   # 与 drivers/robot/grasp_driver.py 的 GRIPPER_MAX_DISTANCE_M=0.09 对齐。
   max_gripper_width: 0.09
@@ -113,6 +135,9 @@ anygrasp:
   top_k: 20
   target_margin_px: 12
   target_expand_ratio: 1.35
+  # 优先使用 YOLO 分割掩膜（适度膨胀）做 region_steering；点数不足时自动回退到扩展 bbox
+  use_mask_steering: true
+  mask_dilate_px: 10
 
   # 第一阶段保守限制：只取接近竖直向下的候选。base 系还会再检查一次。
   # 相机-only 无机械臂位姿时使用 [0,0,1]（Gemini 2 光轴朝下指向桌面）。
@@ -131,7 +156,6 @@ anygrasp:
     base_workspace_min: [0.10, -0.25, 0.01]
     base_workspace_max: [0.6,  0.25, 0.45]  # dry-run 阶段性扩展；真机前按可达性复核
 
-
 # AnyGrasp 抓取放置
 place:
   container_class: "box"
@@ -139,21 +163,24 @@ place:
   # base 坐标系下的 TCP 释放高度，不是相对容器底部的距离
   height_m: 0.10
 
-  # 先到容器上方预放置点，再下降 8 cm 到释放点
+  # 先到容器上方预放置点，再下降 8 cm 到释放点；释放后同样先垂直退回 pre-place 再回 ready
   pre_place_offset_m: 0.08
+  retract_to_pre_place: true
 
-  # 固定放置姿态，沿用原 OBB 放置程序的朝向
-  # orientation_rpy: [0.0, 1.2, 0.0]
+  # 容器 XY 优先使用分割掩膜质心（减少斜视/遮挡时的框中心偏移）
+  use_mask_centroid: true
+
+  # 固定放置姿态
   orientation_rpy: [0.0, 0.7, 0.0]
 
-  # 容器掩膜有效深度的分位数；容器 XY 使用检测框中心
+  # 容器掩膜有效深度的分位数
   container_depth_quantile: 0.5
 
-  # 保守慢速轨迹
-  pregrasp_duration_s: 1.0    # 原 1.5，空爪接近
-  grasp_duration_s: 1.0       # 原 1.2，插入抓取
-  retreat_duration_s: 1.5     # 带物体回撤，保持不变
-  ready_duration_s: 2.0       # 带物体回 ready，保持不变
-  pre_place_duration_s: 2.0   # 带物体前往容器，保持不变
-  place_duration_s: 1.0       # 原 1.2，下降放置
-  release_wait_s: 0.5         # 原 1.0，松爪后的额外等待
+  # 轨迹时长
+  pregrasp_duration_s: 1.0    # 空爪接近
+  grasp_duration_s: 1.0       # 插入抓取
+  retreat_duration_s: 1.5     # 带物体回撤
+  ready_duration_s: 2.0       # 带物体回 ready
+  pre_place_duration_s: 2.0   # 带物体前往容器
+  place_duration_s: 1.0       # 下降放置与释放后抬升
+  release_wait_s: 0.5         # 松爪后的额外等待

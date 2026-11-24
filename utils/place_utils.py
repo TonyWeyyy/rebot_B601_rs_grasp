@@ -1,38 +1,24 @@
-"""Pure helpers for AnyGrasp target-to-container placement.
+"""Pure helpers for target-to-container placement.
 
 No camera, SDK, CAN, or robot connection is created in this module.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
+from utils.target_selector import select_container
 from utils.yolo_utils import YoloDetection
 
-
-def _same_detection(a: YoloDetection, b: YoloDetection) -> bool:
-    return (a.result_index, a.detection_index) == (b.result_index, b.detection_index)
-
-
-def select_container(
-    detections: list[YoloDetection],
-    container_class: str,
-    *,
-    exclude: Optional[YoloDetection] = None,
-) -> Optional[YoloDetection]:
-    """Select the highest-confidence exact/contains class match."""
-    candidates = [
-        det for det in detections
-        if exclude is None or not _same_detection(det, exclude)
-    ]
-    if container_class:
-        query = container_class.casefold()
-        exact = [det for det in candidates if det.class_name.casefold() == query]
-        contains = [det for det in candidates if query in det.class_name.casefold()]
-        candidates = exact or contains
-    return max(candidates, key=lambda det: det.conf) if candidates else None
+__all__ = [
+    "build_place_poses",
+    "detection_center_cam",
+    "select_container",
+    "validate_base_pose",
+    "validate_target_container_separation",
+]
 
 
 def detection_center_cam(
@@ -44,8 +30,15 @@ def detection_center_cam(
     max_depth_m: float = 1.0,
     depth_quantile: float = 0.5,
     min_depth_pixels: int = 30,
+    use_mask_centroid: bool = False,
 ) -> np.ndarray:
-    """Estimate a detection's metric center from its bbox center and masked depth."""
+    """Estimate a detection's metric center from masked depth and mask centroid or bbox center.
+
+    When ``use_mask_centroid=True``, the 2D center ``(u, v)`` is computed as the
+    mean pixel coordinate of valid masked depth pixels (plus 0.5-pixel box
+    convention alignment only when falling back to bbox center), which reduces
+    lateral shift for angled or partially occluded containers.
+    """
     depth = np.asarray(depth_mm)
     if depth.ndim != 2:
         raise ValueError("depth_mm must be a single-channel image")
@@ -64,9 +57,15 @@ def detection_center_cam(
         raise ValueError(f"Container has only {count} valid depth pixels; need {min_depth_pixels}")
 
     z = float(np.quantile(depth[valid].astype(np.float32) / 1000.0, float(depth_quantile)))
-    x1, y1, x2, y2 = [float(value) for value in detection.bbox_xyxy]
-    u = 0.5 * (x1 + x2)
-    v = 0.5 * (y1 + y2)
+    if use_mask_centroid:
+        vs, us = np.nonzero(valid)
+        u = float(np.mean(us))
+        v = float(np.mean(vs))
+    else:
+        x1, y1, x2, y2 = [float(value) for value in detection.bbox_xyxy]
+        u = 0.5 * (x1 + x2)
+        v = 0.5 * (y1 + y2)
+
     K = np.asarray(K, dtype=np.float64)
     x = (u - float(K[0, 2])) * z / float(K[0, 0])
     y = (v - float(K[1, 2])) * z / float(K[1, 1])

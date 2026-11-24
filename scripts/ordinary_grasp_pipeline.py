@@ -1,5 +1,5 @@
 """
-Ordinary grasp test.
+Ordinary grasp test (camera + YOLO only; no robot connection).
 
 Keys:
   Left click: sample depth at a pixel.
@@ -10,26 +10,25 @@ Usage:
     python scripts/ordinary_grasp_pipeline.py
 """
 
-import os
-os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
+from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-import cv2
-from ultralytics import YOLO
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
+import cv2
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-for _path in (PROJECT_ROOT,):
-    path_str = str(_path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from drivers.camera import make_camera
-from utils.camera_utils import load_config
-from utils.ordinary_grasp import draw_grasp, estimate_grasps, get_depth_mm, select_best_grasp
-from utils.transforms import canonicalize_parallel_gripper_tcp_rotation, rotation_matrix_to_euler_zyx
+from drivers.camera import make_camera  # noqa: E402
+from utils.camera_utils import load_config  # noqa: E402
+from utils.ordinary_grasp import draw_grasp, estimate_grasps, get_depth_mm, select_best_grasp  # noqa: E402
+from utils.transforms import canonicalize_parallel_gripper_tcp_rotation, rotation_matrix_to_euler_zyx  # noqa: E402
+from utils.yolo_utils import load_yolo  # noqa: E402
 
 
 clicked_point = {"u": -1, "v": -1}
@@ -54,32 +53,19 @@ def print_best_grasp(grasp) -> None:
     print(f"  tcp_rpy={rotation_matrix_to_euler_zyx(tcp_rotation).tolist()}")
 
 
-def main():
-    config_path = PROJECT_ROOT / "config" / "default.yaml"
-    models_dir = PROJECT_ROOT / "models"
-    models_dir.mkdir(parents=True, exist_ok=True)
-
-    cfg = load_config(config_path)
+def main() -> None:
+    cfg = load_config(PROJECT_ROOT / "config" / "default.yaml")
     cam_type = str(cfg.get("camera", {}).get("type", "")).lower()
-    yolo_cfg = cfg.get("yolo", {})
-    det_cfg = cfg.get("detection", {})
     grasp_cfg = cfg.get("grasp_pipeline", {}).get("grasp", {})
-
-    model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
-    device = yolo_cfg.get("device", "cpu")
-    use_world = bool(yolo_cfg.get("use_world", False))
-    custom_classes = list(yolo_cfg.get("custom_classes", ["cup"]))
-    conf_thres = float(det_cfg.get("conf_threshold", 0.25))
-    iou_thres = float(det_cfg.get("iou_threshold", 0.45))
     depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
+    approach_mode = str(grasp_cfg.get("ordinary_approach_mode", "camera_z"))
 
     print("=== Init YOLO ===")
-    model_path = models_dir / model_name
-    print(f"Load model: {model_path}")
-    model = YOLO(str(model_path))
-    if use_world and ("world" in model_name.lower() or "yoloe" in model_name.lower()):
-        model.set_classes(custom_classes)
-        print(f"Open-vocabulary classes: {custom_classes}")
+    model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
+    model_name = yolo_opts.get("model_name", "yolo")
+    device = yolo_opts.get("device", "cpu")
+    conf_thres = float(yolo_opts.get("conf", 0.25))
+    iou_thres = float(yolo_opts.get("iou", 0.45))
 
     print(f"\n=== Init camera: {cam_type} ===")
     cam = make_camera(cfg)
@@ -109,7 +95,13 @@ def main():
                 iou=iou_thres,
             )
 
-            grasps = estimate_grasps(results, depth_mm, K, depth_quantile=depth_quantile)
+            grasps = estimate_grasps(
+                results,
+                depth_mm,
+                K,
+                depth_quantile=depth_quantile,
+                approach_mode=approach_mode,
+            )
             for grasp in grasps:
                 draw_grasp(color_image, grasp)
 
@@ -150,7 +142,7 @@ def main():
                         2,
                     )
 
-            title = f"{cam_type.upper()} | {model_name} | ordinary grasp"
+            title = f"{cam_type.upper()} | {model_name} | ordinary grasp ({approach_mode})"
             cv2.putText(color_image, title, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
             cv2.imshow(window_name, color_image)
 

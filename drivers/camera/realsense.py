@@ -7,9 +7,10 @@ RealsenseCamera:
 """
 from __future__ import annotations
 
-import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
+
+import numpy as np
 
 from .base import CameraDriver, CameraFrameError
 
@@ -23,11 +24,13 @@ class RealsenseCamera(CameraDriver):
         height: int = 720,
         fps: int = 30,
         calib_dir: Optional[str] = None,
+        serial: Optional[str] = None,
     ) -> None:
         self._w = width
         self._h = height
         self._fps = fps
         self._calib_dir = Path(calib_dir) if calib_dir else None
+        self._serial = str(serial).strip() if serial else None
 
         self._pipeline = None
         self._align = None
@@ -49,6 +52,8 @@ class RealsenseCamera(CameraDriver):
         for width, height, fps in self._profile_candidates():
             pipeline = rs.pipeline()
             config = rs.config()
+            if self._serial is not None:
+                config.enable_device(self._serial)
             config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
             try:
@@ -68,7 +73,7 @@ class RealsenseCamera(CameraDriver):
             raise RuntimeError(
                 "RealSense camera not found or no RGB-D profile is available:\n  "
                 + "\n  ".join(errors)
-                + "\n  Check USB connection or other camera clients."
+                + "\n  Check USB connection, serial number, or other camera clients."
             )
 
         # Intrinsics
@@ -115,7 +120,11 @@ class RealsenseCamera(CameraDriver):
 
             color_bgr = np.asanyarray(cf.get_data())
             depth_raw = np.asanyarray(df.get_data())   # uint16, depth units
-            depth_mm  = (depth_raw * self._depth_scale_mm).astype(np.uint16)
+            depth_mm = np.clip(
+                np.rint(depth_raw.astype(np.float32) * self._depth_scale_mm),
+                0,
+                np.iinfo(np.uint16).max,
+            ).astype(np.uint16)
             self._reset_frame_failures()
             return color_bgr, depth_mm
         except CameraFrameError:

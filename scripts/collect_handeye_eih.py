@@ -7,43 +7,38 @@ Modes:
   Manual mode (--manual): gravity compensation lets the user move the arm by
                           hand. Release the arm to lock it, then press Enter.
 
-Setup:
-  The camera is mounted on the end effector.
-  The ArUco marker is fixed on the work surface.
-
 Usage:
-    python scripts/collect_handeye_eih.py           # auto mode
-    python scripts/collect_handeye_eih.py --manual  # manual gravity mode
+    python scripts/collect_handeye_eih.py                   # auto mode
+    python scripts/collect_handeye_eih.py --manual          # manual gravity mode
+    python scripts/collect_handeye_eih.py --reject-outliers --compare-methods
 """
 
+from __future__ import annotations
+
+import argparse
 import os
+import queue
 import sys
 import threading
-import argparse
-import queue
 import time
+from pathlib import Path
+
 import cv2
 import numpy as np
-from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
+from calibration.hand_eye import CalibMode, HandEyeCalibrator
 from drivers.camera import make_camera
 from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
 from reBotArm_control_py.actuator import RebotArm
 from reBotArm_control_py.controllers import RebotArmEndPose
-from calibration.hand_eye import CalibMode, HandEyeCalibrator
 from utils.camera_utils import load_config
 from utils.transforms import rotation_matrix_to_euler_zyx
 
 
-# ==========================================
-# Preset calibration poses in Cartesian space, using meters and radians.
-# (x, y, z, roll, pitch, yaw)
-# pitch > 0 points the end effector downward toward the ArUco marker.
-# ==========================================
 CALIB_POSES_XYZ = [
     # Center region, large pitch, yaw sweep.
     (0.28, -0.16, 0.26, -0.30, 0.80, -0.90),
@@ -119,15 +114,12 @@ AUTO_MARKER_STABLE_FRAMES = 4
 MIN_CALIB_SAMPLES = 5
 
 
-def make_input_thread(line_queue: queue.Queue) -> threading.Thread:
+def make_input_thread(line_queue: queue.Queue, stop_event: threading.Event) -> threading.Thread:
     def _loop():
-        while True:
+        while not stop_event.is_set():
             try:
                 line_queue.put(input())
-            except EOFError:
-                line_queue.put(None)
-                break
-            except KeyboardInterrupt:
+            except (EOFError, KeyboardInterrupt):
                 line_queue.put(None)
                 break
     t = threading.Thread(target=_loop, daemon=True)
@@ -135,26 +127,20 @@ def make_input_thread(line_queue: queue.Queue) -> threading.Thread:
     return t
 
 
-# ==========================================
-# Gravity compensation controller for manual mode.
-# ==========================================
 class GravityCompController:
-    """MIT mode with end-effector velocity locking for hand-guided poses.
-
-    Reference: reBotArm_control_py/example/10_gravity_compensation_lock.py
-    """
+    """MIT mode with end-effector velocity locking for hand-guided poses."""
     KP = 8.0
-    KD = 1.5
-    V_THRESH  = 0.04   # End-effector linear velocity threshold (m/s)
-    W_THRESH  = 0.08   # End-effector angular velocity threshold (rad/s)
+    KD = 1.0
+    KI = 1.0
+    INTEGRAL_LIMIT = 0.3
+    V_THRESH = 0.04   # End-effector linear velocity threshold (m/s)
+    W_THRESH = 0.08   # End-effector angular velocity threshold (rad/s)
 
     def __init__(self, arm: RebotArm) -> None:
-        from reBotArm_control_py.dynamics import compute_generalized_gravity
-        from reBotArm_control_py.kinematics import (
-            load_robot_model, get_end_effector_frame_id,
-        )
-        from reBotArm_control_py.kinematics.robot_model import pad_q_for_model
         import pinocchio as pin
+        from reBotArm_control_py.dynamics import compute_generalized_gravity
+        from reBotArm_control_py.kinematics import get_end_effector_frame_id, load_robot_model
+        from reBotArm_control_py.kinematics.robot_model import pad_q_for_model
 
         self._compute_gravity = compute_generalized_gravity
         self._pad_q_for_model = pad_q_for_model
@@ -168,17 +154,16 @@ class GravityCompController:
                 "reBotArm_control_py/config."
             )
         self._model = load_robot_model()
-        self._data  = self._model.createData()
+        self._data = self._model.createData()
         self._ee_id = get_end_effector_frame_id(self._model)
 
-        self._n = None          # Joint count, set after connect.
+        self._n = None
         self._q_target = None
         self._integral = None
         self._gc_running = threading.Event()
         self._io_lock = threading.RLock()
 
     def start(self) -> None:
-        """Connect, enable, set MIT mode, and start gravity compensation."""
         self._arm.connect()
         print("[GravityComp] Connected")
 
@@ -198,13 +183,12 @@ class GravityCompController:
         self._q_target = q0.copy()
         self._integral = np.zeros(n)
 
-        print(f"[GravityComp] MIT mode, kp={self.KP} kd={self.KD}. Move the arm by hand.")
+        print(f"[GravityComp] MIT mode, kp={self.KP} kd={self.KD} ki={self.KI}. Move the arm by hand.")
 
         self._gc_running.set()
         self._arm.start_control_loop(self._worker, rate=self._arm.rate)
 
     def _wait_state_valid(self, timeout: float = 2.0) -> None:
-        """Wait until all motor feedback is available."""
         t_end = time.monotonic() + timeout
         while time.monotonic() < t_end:
             with self._io_lock:
@@ -219,7 +203,6 @@ class GravityCompController:
         raise RuntimeError("[GravityComp] Arm feedback is not ready")
 
     def safe_home(self) -> None:
-        """Stop gravity compensation, home with an SDK controller, then disconnect."""
         self._gc_running.clear()
         try:
             print("[GravityComp] Homing...")
@@ -253,7 +236,8 @@ class GravityCompController:
         pin = self._pin
         model, data, ee_id = self._model, self._data, self._ee_id
         n = self._n
-        KP, KD = self.KP, self.KD
+        KP, KD, KI = self.KP, self.KD, self.KI
+        safe_dt = float(np.clip(dt if dt > 0.0 else 0.002, 0.0, 0.1))
 
         try:
             with self._io_lock:
@@ -264,8 +248,8 @@ class GravityCompController:
             tau_g = self._compute_gravity(model=model, q=q_model)[:n]
 
             q_err = self._q_target - q
-            self._integral += q_err
-            np.clip(self._integral, -0.5, 0.5, out=self._integral)
+            self._integral += KI * q_err * safe_dt
+            np.clip(self._integral, -self.INTEGRAL_LIMIT, self.INTEGRAL_LIMIT, out=self._integral)
 
             qd_model = np.zeros(model.nv)
             qd_model[: min(model.nv, n)] = qd[: min(model.nv, n)]
@@ -292,25 +276,40 @@ class GravityCompController:
             pass
 
 
-# ==========================================
-# Main flow.
-# ==========================================
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Eye-in-hand calibration data collection")
-    parser.add_argument("--manual", action="store_true",
-                        help="manual mode: gravity compensation; move the arm by hand and press Enter to capture")
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="manual mode: gravity compensation; move the arm by hand and press Enter to capture",
+    )
+    parser.add_argument(
+        "--reject-outliers",
+        action="store_true",
+        help="automatically reject high-residual outlier samples before saving",
+    )
+    parser.add_argument(
+        "--compare-methods",
+        action="store_true",
+        help="compare all 5 OpenCV hand-eye solvers on the collected samples",
+    )
+    parser.add_argument(
+        "--save-samples",
+        action="store_true",
+        help="also save raw (T_gripper2base, T_marker2cam) pairs to hand_eye_samples.npz",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
-    cfg  = load_config(root / "config" / "default.yaml")
+    cfg = load_config(root / "config" / "default.yaml")
 
-    cam_type   = cfg["camera"]["type"]
-    calib_dir  = root / "config" / "calibration" / cam_type
-    aruco_cfg  = cfg["calibration"]["aruco"]
-    he_method  = cfg["calibration"].get("hand_eye_method", "TSAI")
-    save_path  = calib_dir / "hand_eye.npz"
+    cam_type = cfg["camera"]["type"]
+    calib_dir = root / "config" / "calibration" / cam_type
+    aruco_cfg = cfg["calibration"]["aruco"]
+    he_method = cfg["calibration"].get("hand_eye_method", "TSAI")
+    save_path = calib_dir / "hand_eye.npz"
+    samples_path = calib_dir / "hand_eye_samples.npz"
 
-    # Camera.
     cam = make_camera(cfg)
     cam.setup_aruco(
         marker_length_m=aruco_cfg["marker_length_m"],
@@ -318,10 +317,8 @@ def main():
         target_marker_id=aruco_cfg.get("target_marker_id"),
     )
 
-    # Calibrator.
     calibrator = HandEyeCalibrator(CalibMode.EYE_IN_HAND, method=he_method)
 
-    # Robot.
     mode_str = "manual (gravity compensation)" if args.manual else f"auto ({len(CALIB_POSES_XYZ)} preset poses)"
     gc_ctrl: GravityCompController | None = None
     rebotarm: RebotArm | None = None
@@ -342,12 +339,11 @@ def main():
     }
     result_saved = False
 
-    print(f"\n=== Eye-in-Hand Calibration ===")
+    print("\n=== Eye-in-Hand Calibration ===")
     print(f"Camera: {cam_type}  |  Mode: {mode_str}  |  Solver: {he_method}")
     print(f"ArUco size: {aruco_cfg['marker_length_m']*100:.0f}cm  |  Output: {save_path}")
     print()
 
-    # Open the camera first so the arm is not enabled if camera setup fails.
     try:
         cam.open()
         print("Warming up camera...", end="", flush=True)
@@ -359,7 +355,7 @@ def main():
         except Exception:
             pass
         print(f"[Camera] Initialization failed: {e}")
-        sys.exit(1)
+        return 1
 
     robot_cfg = cfg.get("robot", {})
     try:
@@ -397,7 +393,7 @@ def main():
         except Exception:
             pass
         print(f"[Robot] Connection failed: {e}")
-        sys.exit(1)
+        return 1
 
     if args.manual:
         print("[Controls] Enter=capture  c/q=finish and solve  pos=print current TCP pose")
@@ -407,9 +403,10 @@ def main():
 
     latest_pose = None
     line_queue: queue.Queue | None = None
+    input_stop = threading.Event()
     if sys.stdin.isatty():
         line_queue = queue.Queue()
-        make_input_thread(line_queue)
+        make_input_thread(line_queue, input_stop)
     else:
         print("[Hint] Non-interactive terminal detected; terminal commands are disabled")
 
@@ -448,6 +445,10 @@ def main():
     def compute_and_save(reason: str) -> bool:
         nonlocal result_saved
         print(f"\n[Finish] {reason}")
+        if args.save_samples and calibrator.n_samples > 0:
+            calibrator.save_samples(samples_path)
+            print(f"[Result] Raw samples saved to {samples_path}")
+
         if calibrator.n_samples < MIN_CALIB_SAMPLES:
             print(f"[Result] Not enough samples ({calibrator.n_samples} < {MIN_CALIB_SAMPLES}); calibration was not solved")
             if save_path.exists():
@@ -456,12 +457,36 @@ def main():
 
         print(f"[Result] Solving with {calibrator.n_samples} samples...")
         try:
-            result = calibrator.calibrate(min_samples=MIN_CALIB_SAMPLES)
+            result = calibrator.calibrate(
+                min_samples=MIN_CALIB_SAMPLES,
+                reject_outliers=args.reject_outliers,
+            )
             HandEyeCalibrator.save(result, save_path)
             t = result.T_result[:3, 3]
             R = result.T_result[:3, :3]
             print(f"[Result] T_cam2gripper translation: x={t[0]:.4f} y={t[1]:.4f} z={t[2]:.4f} m")
             print(f"[Result] Rotation matrix:\n{R}")
+            if result.metrics is not None:
+                m = result.metrics
+                print(
+                    f"[Result] Consistency RMSE: trans={m.trans_rmse_m * 1000:.2f}mm "
+                    f"(max={m.trans_max_m * 1000:.2f}mm), "
+                    f"rot={m.rot_rmse_deg:.2f}deg (max={m.rot_max_deg:.2f}deg)"
+                )
+                if m.rejected_indices:
+                    print(f"[Result] Rejected outlier sample indices: {m.rejected_indices}")
+            if args.compare_methods:
+                print("[Result] Solver comparison:")
+                for name, res in calibrator.compare_methods(
+                    min_samples=MIN_CALIB_SAMPLES,
+                    reject_outliers=args.reject_outliers,
+                ).items():
+                    if res.metrics is not None:
+                        print(
+                            f"  {name:10s}: trans_rmse={res.metrics.trans_rmse_m * 1000:6.2f}mm  "
+                            f"rot_rmse={res.metrics.rot_rmse_deg:5.2f}deg  "
+                            f"t={np.round(res.T_result[:3, 3], 4).tolist()}"
+                        )
             print(f"[Result] [OK] Saved to {save_path}")
             if calibrator.n_samples < 15:
                 print("[Result] Tip: fewer than 15 samples; collect more samples for better accuracy")
@@ -548,7 +573,6 @@ def main():
         return False
 
     def safe_home_and_disconnect() -> None:
-        """Stop active control, return home with a fresh SDK controller, then disconnect."""
         if rebotarm is None or auto_controller_mode is None:
             return
         try:
@@ -580,18 +604,14 @@ def main():
             return True
 
         line = raw.strip().lower()
-
         if line in {"q", "c"}:
             return True
-
         if line == "pos":
             _print_fk()
             return False
-
         if args.manual and line == "":
             capture_sample(latest_pose, "manual capture")
             return False
-
         if line:
             if args.manual:
                 print("  Manual commands: Enter=capture  c/q=finish and solve  pos=print current TCP pose")
@@ -599,7 +619,6 @@ def main():
                 print("  Auto commands: c/q=finish and solve  pos=print current TCP pose")
         return False
 
-    # Main loop.
     WIN = "Eye-in-Hand Calibration  (operate in terminal)"
     finish_reason = "normal finish"
     try:
@@ -608,12 +627,11 @@ def main():
         while True:
             bgr, _ = cam.get_frame()
             if bgr is not None:
-                pose = cam.detect_aruco(bgr)
+                pose, vis = cam.detect_and_draw_aruco(bgr)
                 latest_pose = pose
                 if tick_auto(pose):
                     finish_reason = "auto traversal completed"
-                vis  = cam.draw_aruco(bgr)
-                n    = calibrator.n_samples
+                n = calibrator.n_samples
 
                 def osd(text, y, color=(220, 220, 220)):
                     cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
@@ -674,6 +692,7 @@ def main():
         print("\n[Ctrl+C] Stopping and trying to solve")
 
     finally:
+        input_stop.set()
         cv2.destroyAllWindows()
         cam.close()
         if gc_ctrl is not None:
@@ -685,8 +704,8 @@ def main():
     print(f"\nDone, total samples: {calibrator.n_samples}.")
     if calibrator.n_samples > 0 and not result_saved:
         print("Tip: hand_eye.npz was not generated; collect more samples and try again.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-    os._exit(0)
+    raise SystemExit(main())

@@ -17,18 +17,10 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
-# The delivered source archive intentionally omits the large vendor SDK. Stub
-# hardware modules so this test remains runnable in the source-only archive.
-for subdir in ("", "models", "dataset", "utils", "pointnet2", "graspnetAPI"):
-    path = str(ROOT / "sdk" / "graspnet-baseline" / subdir)
-    if path not in sys.path:
-        sys.path.insert(0, path)
-
-sys.modules.setdefault("open3d", types.ModuleType("open3d"))
-graspnet_api_stub = types.ModuleType("graspnetAPI")
 
 class FakeGrasp:
     pass
+
 
 class FakeGraspGroup:
     def __init__(self, array=None):
@@ -63,49 +55,18 @@ class FakeGraspGroup:
             return self.items[item]
         return FakeGraspGroup(np.asarray(self.items, dtype=object)[item].tolist())
 
-graspnet_api_stub.Grasp = FakeGrasp
-graspnet_api_stub.GraspGroup = FakeGraspGroup
-sys.modules["graspnetAPI"] = graspnet_api_stub
 
-vis_stub = types.ModuleType("utils.graspnet_utils")
-vis_stub.Open3DGraspWindow = object
-vis_stub.draw_detections_overlay = lambda color, *args: color
-vis_stub.draw_best_grasp_projection = lambda *args: None
-vis_stub.draw_status = lambda color, *args, **kwargs: color
-sys.modules["utils.graspnet_utils"] = vis_stub
+if "graspnetAPI" not in sys.modules:
+    graspnet_api_stub = types.ModuleType("graspnetAPI")
+    graspnet_api_stub.Grasp = FakeGrasp
+    graspnet_api_stub.GraspGroup = FakeGraspGroup
+    sys.modules["graspnetAPI"] = graspnet_api_stub
 
-grasp_stub = types.ModuleType("grasp")
-grasp_stub.IkChecker = object
-grasp_stub._select_executable_grasp = lambda *args: None
-grasp_stub._wait_motion = lambda *args: None
-grasp_stub._move_ready = lambda controller, cfg: controller.move_to_pose(
-    *cfg.get("position", [0.3, 0, 0.2, 0, 1.2, 0]), duration=cfg.get("duration", 4.0)
-)
-sys.modules["grasp"] = grasp_stub
-
-camera_stub = types.ModuleType("drivers.camera")
-camera_stub.CameraDriver = object
-camera_stub.make_camera = lambda cfg: None
-sys.modules["drivers.camera"] = camera_stub
-
-driver_stub = types.ModuleType("drivers.robot.grasp_driver")
-driver_stub.GRIPPER_MAX_DISTANCE_M = 0.09
-driver_stub.GraspDriver = object
-driver_stub.selected_arm_config = lambda root: None
-sys.modules["drivers.robot.grasp_driver"] = driver_stub
-
-sdk_parent = types.ModuleType("reBotArm_control_py")
-sdk_parent.__path__ = []
-sys.modules["reBotArm_control_py"] = sdk_parent
-for name, attr in (("reBotArm_control_py.actuator", "RebotArm"), ("reBotArm_control_py.controllers", "RebotArmEndPose")):
-    module = types.ModuleType(name)
-    setattr(module, attr, object)
-    sys.modules[name] = module
-
-import anygrasp_place as app
-import utils.anygrasp_utils as ag
-import utils.place_utils as pu
-from utils.yolo_utils import YoloDetection
+import anygrasp_place as app  # noqa: E402
+import core.robot_session as robot_session  # noqa: E402
+import utils.anygrasp_utils as ag  # noqa: E402
+import utils.place_utils as pu  # noqa: E402
+from utils.yolo_utils import YoloDetection  # noqa: E402
 
 
 def detection(name, conf, bbox, shape=(40, 40)):
@@ -126,7 +87,7 @@ class PlaceGeometryTest(unittest.TestCase):
         box = detection("box", 0.8, (10, 10, 30, 30))
         depth = np.full((40, 40), 500, dtype=np.uint16)
         K = np.array([[100.0, 0, 20], [0, 100.0, 20], [0, 0, 1]])
-        center = pu.detection_center_cam(box, depth, K)
+        center = pu.detection_center_cam(box, depth, K, use_mask_centroid=False)
         np.testing.assert_allclose(center, [0, 0, 0.5])
         T = np.eye(4)
         place, pre, measured = pu.build_place_poses(
@@ -153,8 +114,8 @@ class PlaceGeometryTest(unittest.TestCase):
         color = np.zeros((40, 40, 3), dtype=np.uint8)
         depth = np.full((40, 40), 500, dtype=np.uint16)
         K = np.array([[50.0, 0, 20], [0, 50.0, 20], [0, 0, 1]])
-        group = ag.GraspGroup()
-        grasp = ag.Grasp()
+        group = FakeGraspGroup()
+        grasp = FakeGrasp()
         grasp.score, grasp.width, grasp.height, grasp.depth = 0.8, 0.05, 0.03, 0.02
         grasp.rotation_matrix = np.eye(3)
         grasp.translation = np.array([0, 0, 0.5])
@@ -164,7 +125,7 @@ class PlaceGeometryTest(unittest.TestCase):
             def get_grasp(self, points, options):
                 return group
 
-        points = np.tile(np.array([0.0, 0.0, 0.5]), (400, 1))
+        points = np.tile(np.array([0.0, 0.0, 0.5], dtype=np.float32), (400, 1))
         with patch.object(ag, "detect_objects", side_effect=AssertionError("YOLO ran twice")), patch.object(
             ag, "build_point_cloud", return_value=(None, points, None)
         ):
@@ -173,15 +134,17 @@ class PlaceGeometryTest(unittest.TestCase):
                 cfg={"lims": [-1, 1, -1, 1, 0.1, 0.8], "max_input_points": 1000},
                 min_depth=0.05, max_depth=1.0,
                 yolo_model=object(), detections=[toy, box], target_class="toy",
+                build_o3d=False,
             )
         self.assertIs(result.selected_target, toy)
         self.assertEqual(len(result.detections), 2)
 
 
 class FakeDriver:
-    def __init__(self, grasp_result=True):
+    def __init__(self, grasp_result=True, holding_seq=None):
         self.calls = []
         self.grasp_result = grasp_result
+        self._holding_seq = list(holding_seq) if holding_seq is not None else [True, True]
 
     def open_gripper(self, **kwargs):
         self.calls.append(("open", kwargs))
@@ -190,33 +153,49 @@ class FakeDriver:
         self.calls.append(("grasp",))
         return self.grasp_result
 
+    def is_holding(self):
+        self.calls.append(("is_holding",))
+        return self._holding_seq.pop(0) if self._holding_seq else True
+
 
 class FakeController:
+    """Matches real RebotArmEndPose.move_to_traj signature."""
+
     def __init__(self):
         self.calls = []
 
-    def move_to_traj(self, *args, duration=None):
-        self.calls.append(("move", args, duration))
-        return True
-
-    def move_to_pose(self, *args, duration=None):
-        self.calls.append(("ready", args, duration))
+    def move_to_traj(self, x=0.0, y=0.0, z=0.0, roll=0.0, pitch=0.0, yaw=0.0, duration=2.0):
+        self.calls.append(("move_to_traj", (x, y, z, roll, pitch, yaw), duration))
         return True
 
 
 class SequenceSafetyTest(unittest.TestCase):
     def setUp(self):
         self.controller = FakeController()
-        self.driver = FakeDriver()
-        self.poses = ((0.3, 0, 0.1, 0, 1.2, 0),) * 5
+        self.grasp6d = (0.30, 0.00, 0.06, 0.0, 1.2, 0.0)
+        self.pre6d = (0.30, 0.00, 0.14, 0.0, 1.2, 0.0)
+        self.retreat6d = (0.30, 0.00, 0.14, 0.0, 1.2, 0.0)
+        self.pre_place6d = (0.25, 0.15, 0.18, 0.0, 0.7, 0.0)
+        self.place6d = (0.25, 0.15, 0.10, 0.0, 0.7, 0.0)
+        self.ready_cfg = {"x": 0.30, "y": 0.0, "z": 0.30, "roll": 0.0, "pitch": 0.7, "yaw": 0.0, "duration": 2.0}
 
-    def execute(self, dry=False, empty=False, confirm=False):
-        driver = FakeDriver(not empty)
-        with patch.object(app, "_wait_motion", lambda *args: None), patch.object(app.time, "sleep", lambda *args: None):
+    def execute(self, dry=False, empty=False, confirm=False, holding_seq=None, retract_to_pre_place=True):
+        driver = FakeDriver(not empty, holding_seq=holding_seq)
+        with patch.object(robot_session, "wait_motion", lambda *args, **kwargs: True), patch.object(
+            robot_session.time, "sleep", lambda *args: None
+        ):
             ok = app._execute_place_sequence(
-                self.controller, driver, *self.poses,
-                ready_cfg={"position": [0.3, 0, 0.2, 0, 1.2, 0]},
-                place_cfg={}, dry_run=dry, confirm_motion=confirm,
+                self.controller,
+                driver,
+                self.grasp6d,
+                self.pre6d,
+                self.retreat6d,
+                self.pre_place6d,
+                self.place6d,
+                ready_cfg=self.ready_cfg,
+                place_cfg={"retract_to_pre_place": retract_to_pre_place},
+                dry_run=dry,
+                confirm_motion=confirm,
             )
         return ok, driver
 
@@ -226,12 +205,24 @@ class SequenceSafetyTest(unittest.TestCase):
         self.assertEqual(self.controller.calls, [])
         self.assertEqual(driver.calls, [])
 
-    def test_empty_grasp_never_moves_to_place(self):
+    def test_empty_grasp_retreats_vertically_and_never_moves_to_place(self):
         ok, driver = self.execute(empty=True)
         self.assertFalse(ok)
-        moves = [call for call in self.controller.calls if call[0] == "move"]
-        self.assertEqual(len(moves), 2)  # pregrasp, grasp only
-        self.assertEqual(len(self.driver.calls), 0)
+        poses = [call[1] for call in self.controller.calls]
+        # pregrasp -> grasp -> retreat -> ready (no pre-place or place)
+        self.assertEqual(len(poses), 4)
+        self.assertEqual(poses[2], self.retreat6d)
+        self.assertEqual(poses[3], (0.30, 0.0, 0.30, 0.0, 0.7, 0.0))
+        self.assertEqual([c[0] for c in driver.calls], ["open", "grasp"])
+
+    def test_midair_drop_aborts_placement(self):
+        ok, driver = self.execute(holding_seq=[True, False])
+        self.assertFalse(ok)
+        poses = [call[1] for call in self.controller.calls]
+        # pregrasp -> grasp -> retreat -> ready; aborts before pre-place
+        self.assertEqual(len(poses), 4)
+        self.assertNotIn(self.pre_place6d, poses)
+        self.assertNotIn(self.place6d, poses)
 
     def test_bad_confirmation_cancels_before_motion(self):
         with patch.object(builtins, "input", return_value="yes"):
@@ -244,16 +235,20 @@ class SequenceSafetyTest(unittest.TestCase):
         with patch.object(builtins, "input", side_effect=["YES", "place"]):
             ok, driver = self.execute(confirm=True)
         self.assertFalse(ok)
-        moves = [call for call in self.controller.calls if call[0] == "move"]
-        self.assertEqual(len(moves), 3)  # pregrasp, grasp, retreat; no pre-place/place
-        self.assertEqual([call[0] for call in driver.calls], ["open", "grasp"])
+        poses = [call[1] for call in self.controller.calls]
+        self.assertEqual(len(poses), 4)  # pregrasp, grasp, retreat, ready
+        self.assertEqual([c[0] for c in driver.calls if c[0] != "is_holding"], ["open", "grasp"])
 
-    def test_success_sequence_releases_only_at_container(self):
-        ok, driver = self.execute()
+    def test_success_sequence_retracts_vertically_after_release(self):
+        ok, driver = self.execute(retract_to_pre_place=True)
         self.assertTrue(ok)
-        moves = [call for call in self.controller.calls if call[0] == "move"]
-        self.assertEqual(len(moves), 5)
-        self.assertEqual([call[0] for call in driver.calls], ["open", "grasp", "open", "open"])
+        poses = [call[1] for call in self.controller.calls]
+        # pregrasp, grasp, retreat, ready, pre_place, place, pre_place (retract), ready
+        self.assertEqual(len(poses), 8)
+        self.assertEqual(poses[4], self.pre_place6d)
+        self.assertEqual(poses[5], self.place6d)
+        self.assertEqual(poses[6], self.pre_place6d)
+        self.assertEqual([c[0] for c in driver.calls if c[0] != "is_holding"], ["open", "grasp", "open", "open"])
 
 
 if __name__ == "__main__":

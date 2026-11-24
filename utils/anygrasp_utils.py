@@ -1,4 +1,4 @@
-"""AnyGrasp SDK inference and safety helpers for the existing grasp pipeline.
+"""AnyGrasp SDK inference and safety helpers for the grasp pipeline.
 
 The detector returns graspnetAPI.GraspGroup, so downstream TCP conversion, IK
 checks, grasp execution, and gripper control remain shared with GraspNet.
@@ -9,58 +9,96 @@ from __future__ import annotations
 import sys
 import time
 from argparse import Namespace
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import cv2
 import numpy as np
-import open3d as o3d
-import torch
-from graspnetAPI import Grasp, GraspGroup
 
+from utils.grasp_types import GraspFrameResult, copy_grasp_group
+from utils.pointcloud import (
+    bbox_region_mask,
+    build_point_cloud,
+    mask_region_mask,
+    target_region_mask,
+    workspace_mask,
+)
+from utils.target_selector import select_target, target_status_text
 from utils.yolo_utils import YoloDetection, detect_objects
+
+try:
+    from graspnetAPI import Grasp, GraspGroup
+except ImportError:  # Allow offline geometry/safety imports without graspnetAPI installed.
+    Grasp = Any  # type: ignore[assignment,misc]
+    GraspGroup = None  # type: ignore[assignment,misc]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ANYGRASP_SDK_ROOT = PROJECT_ROOT / "sdk" / "anygrasp_sdk"
 
+# Backward-compatible alias.
+AnyGraspFrameResult = GraspFrameResult
 
-@dataclass
-class AnyGraspFrameResult:
-    grasps: GraspGroup
-    pre_bbox_grasps: GraspGroup
-    bbox_grasps: GraspGroup
-    best: Optional[Grasp]
-    status: str
-    target_status: str
-    detections: list[YoloDetection]
-    selected_target: Optional[YoloDetection]
-    o3d_cloud: o3d.geometry.PointCloud
-    raw_cloud: np.ndarray
+__all__ = [
+    "ANYGRASP_SDK_ROOT",
+    "AnyGraspFrameResult",
+    "GraspFrameResult",
+    "PROJECT_ROOT",
+    "bbox_region_mask",
+    "build_detector",
+    "build_point_cloud",
+    "check_grasp_base_geometry",
+    "infer_frame",
+    "infer_grasps",
+    "mask_region_mask",
+    "resolve_anygrasp_paths",
+    "select_target",
+    "target_region_mask",
+    "target_status_text",
+    "workspace_mask",
+]
 
 
-def _copy_grasps(grasps: GraspGroup) -> GraspGroup:
-    return GraspGroup(grasps.grasp_group_array.copy())
+def _make_empty_grasp_group():
+    if GraspGroup is None:
+        from graspnetAPI import GraspGroup as _GraspGroup
+        return _GraspGroup()
+    return GraspGroup()
 
 
-def _empty_result(status: str, target_status: str, detections=None) -> AnyGraspFrameResult:
-    empty = GraspGroup()
-    return AnyGraspFrameResult(
+def _empty_result(
+    status: str,
+    target_status: str,
+    detections=None,
+    *,
+    build_o3d: bool = False,
+) -> GraspFrameResult:
+    empty = _make_empty_grasp_group()
+    empty_cloud = None
+    if build_o3d:
+        try:
+            import open3d as o3d
+            empty_cloud = o3d.geometry.PointCloud()
+        except ImportError:
+            empty_cloud = None
+    return GraspFrameResult(
         grasps=empty,
-        pre_bbox_grasps=GraspGroup(),
-        bbox_grasps=GraspGroup(),
+        pre_bbox_grasps=_make_empty_grasp_group(),
+        bbox_grasps=_make_empty_grasp_group(),
         best=None,
         status=status,
         target_status=target_status,
         detections=list(detections or []),
         selected_target=None,
-        o3d_cloud=o3d.geometry.PointCloud(),
+        o3d_cloud=empty_cloud,
         raw_cloud=np.empty((0, 3), dtype=np.float32),
+        already_nms=True,
     )
 
 
 def resolve_anygrasp_paths(
-    cfg: dict[str, Any], *, project_root: Path = PROJECT_ROOT, checkpoint_override: str | None = None
+    cfg: dict[str, Any],
+    *,
+    project_root: Path = PROJECT_ROOT,
+    checkpoint_override: str | None = None,
 ) -> tuple[Path, Path]:
     sdk_root = Path(str(cfg.get("sdk_root", ANYGRASP_SDK_ROOT))).expanduser()
     if not sdk_root.is_absolute():
@@ -71,13 +109,14 @@ def resolve_anygrasp_paths(
     checkpoint_value = checkpoint_override or cfg.get("checkpoint", "log/checkpoint_detection.tar")
     checkpoint = Path(str(checkpoint_value)).expanduser()
     if not checkpoint.is_absolute():
-        # 纯文件名和 log/... 都相对于 grasp_detection；其他相对路径相对于项目根目录。
         checkpoint = detection_dir / checkpoint if len(checkpoint.parts) <= 2 else project_root / checkpoint
     return detection_dir.resolve(), checkpoint.resolve()
 
 
 def build_detector(cfg: dict[str, Any], checkpoint_override: str | None = None):
     """Load the current AnyGrasp SDK; no camera or robot connection is created."""
+    import torch
+
     if not torch.cuda.is_available():
         raise RuntimeError("AnyGrasp requires CUDA, but torch.cuda.is_available() is False")
 
@@ -118,96 +157,6 @@ def build_detector(cfg: dict[str, Any], checkpoint_override: str | None = None):
     return detector
 
 
-def build_point_cloud(
-    color_bgr: np.ndarray,
-    depth_mm: np.ndarray,
-    K: np.ndarray,
-    *,
-    min_depth_m: float,
-    max_depth_m: float,
-    max_input_points: int = 100000,
-    point_seed: Optional[int] = 0,
-) -> tuple[o3d.geometry.PointCloud, np.ndarray, np.ndarray]:
-    """Create a metric camera-frame cloud using the project's existing RGB-D convention."""
-    if color_bgr is None or depth_mm is None:
-        raise ValueError("color/depth frame is None")
-    if color_bgr.shape[:2] != depth_mm.shape[:2]:
-        depth_mm = cv2.resize(
-            depth_mm, (color_bgr.shape[1], color_bgr.shape[0]), interpolation=cv2.INTER_NEAREST
-        )
-    depth = np.asarray(depth_mm)
-    mask = (
-        np.isfinite(depth)
-        & (depth > max(0.0, float(min_depth_m)) * 1000.0)
-        & (depth < float(max_depth_m) * 1000.0)
-    )
-    if int(mask.sum()) < 100:
-        raise RuntimeError("Too few valid depth pixels in the configured depth range")
-
-    z = depth.astype(np.float32) / 1000.0
-    h, w = depth.shape
-    us, vs = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    x = (us - float(K[0, 2])) * z / float(K[0, 0])
-    y = (vs - float(K[1, 2])) * z / float(K[1, 1])
-    points = np.stack((x, y, z), axis=-1)[mask].astype(np.float32)
-    colors = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)[mask] / 255.0
-
-    if max_input_points > 0 and len(points) > int(max_input_points):
-        rng = np.random.default_rng(point_seed)
-        indices = rng.choice(len(points), int(max_input_points), replace=False)
-        points = points[indices]
-        colors = colors[indices]
-
-    cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-    cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-    return cloud, points, colors
-
-
-def workspace_mask(points: np.ndarray, lims) -> np.ndarray:
-    limits = np.asarray(lims, dtype=np.float32)
-    if limits.shape != (6,) or not np.isfinite(limits).all():
-        raise ValueError("anygrasp.lims must be [xmin,xmax,ymin,ymax,zmin,zmax]")
-    x0, x1, y0, y1, z0, z1 = limits
-    if not (x0 < x1 and y0 < y1 and z0 < z1):
-        raise ValueError("anygrasp.lims min/max ordering is invalid")
-    return (
-        (points[:, 0] >= x0) & (points[:, 0] <= x1)
-        & (points[:, 1] >= y0) & (points[:, 1] <= y1)
-        & (points[:, 2] >= z0) & (points[:, 2] <= z1)
-    )
-
-
-def bbox_region_mask(
-    points: np.ndarray,
-    bbox_xyxy: tuple[int, int, int, int],
-    K: np.ndarray,
-    *,
-    margin_px: int,
-    expand_ratio: float,
-    image_shape: tuple[int, int],
-) -> np.ndarray:
-    """Project cloud points into the selected YOLO bbox for region_steering."""
-    z = points[:, 2]
-    valid = z > 1e-6
-    u = np.full(len(points), np.nan, dtype=np.float64)
-    v = np.full(len(points), np.nan, dtype=np.float64)
-    u[valid] = float(K[0, 0]) * points[valid, 0] / z[valid] + float(K[0, 2])
-    v[valid] = float(K[1, 1]) * points[valid, 1] / z[valid] + float(K[1, 2])
-
-    x1, y1, x2, y2 = [float(value) for value in bbox_xyxy]
-    expand_ratio = max(1.0, float(expand_ratio))
-    cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-    half_w = 0.5 * max(1.0, x2 - x1) * expand_ratio
-    half_h = 0.5 * max(1.0, y2 - y1) * expand_ratio
-    h, w = image_shape
-    x1 = np.clip(cx - half_w - margin_px, 0, w - 1)
-    x2 = np.clip(cx + half_w + margin_px, 0, w - 1)
-    y1 = np.clip(cy - half_h - margin_px, 0, h - 1)
-    y2 = np.clip(cy + half_h + margin_px, 0, h - 1)
-    return valid & (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
-
-
 def infer_grasps(
     detector,
     points: np.ndarray,
@@ -215,7 +164,7 @@ def infer_grasps(
     cfg: dict[str, Any],
     *,
     preferred_approach_cam=None,
-) -> GraspGroup:
+):
     min_region_points = int(cfg.get("min_region_points", 300))
     if int(region.sum()) < min_region_points:
         raise RuntimeError(f"Only {int(region.sum())} region points; need at least {min_region_points}")
@@ -235,35 +184,15 @@ def infer_grasps(
         "approach_thresh": np.deg2rad(float(cfg.get("approach_thresh_deg", 45.0))),
     })
     if grasps is None or len(grasps) == 0:
-        return GraspGroup()
+        return _make_empty_grasp_group()
     if not dense:
         grasps = grasps.nms()
-    grasps = grasps.sort_by_score()
+    sorted_grasps = grasps.sort_by_score()
+    if sorted_grasps is not None:
+        grasps = sorted_grasps
     threshold = float(cfg.get("score_threshold", 0.0))
     grasps = grasps[np.asarray(grasps.scores) > threshold]
     return grasps
-
-
-def select_target(detections: list[YoloDetection], target_class: Optional[str]) -> Optional[YoloDetection]:
-    if not detections:
-        return None
-    candidates = detections
-    if target_class:
-        target_norm = target_class.casefold()
-        exact = [target for target in detections if target.class_name.casefold() == target_norm]
-        contains = [target for target in detections if target_norm in target.class_name.casefold()]
-        candidates = exact or contains
-    if not candidates:
-        return None
-    return max(candidates, key=lambda target: target.conf)
-
-
-def target_status_text(selected, detections, target_class) -> str:
-    if selected is not None:
-        return f"target={selected.class_name} {selected.conf:.2f} detections={len(detections)}"
-    if target_class:
-        return f"target={target_class} not found detections={len(detections)}"
-    return f"target not found detections={len(detections)}"
 
 
 def infer_frame(
@@ -283,7 +212,8 @@ def infer_frame(
     target_expand_ratio: float = 1.35,
     max_grasp_width_m: Optional[float] = 0.09,
     preferred_approach_cam=None,
-) -> AnyGraspFrameResult:
+    build_o3d: bool = True,
+) -> GraspFrameResult:
     detections_provided = detections is not None
     detections = list(detections or [])
     selected = None
@@ -293,7 +223,12 @@ def infer_frame(
         selected = select_target(detections, target_class)
         if selected is None:
             target_status = target_status_text(selected, detections, target_class)
-            return _empty_result(f"inference skipped: {target_status}", target_status, detections)
+            return _empty_result(
+                f"inference skipped: {target_status}",
+                target_status,
+                detections,
+                build_o3d=build_o3d,
+            )
 
     tic = time.time()
     cloud, points, _ = build_point_cloud(
@@ -304,25 +239,33 @@ def infer_frame(
         max_depth_m=max_depth,
         max_input_points=int(cfg.get("max_input_points", 100000)),
         point_seed=cfg.get("point_seed", 0),
+        build_o3d=build_o3d,
     )
-    region = workspace_mask(points, cfg.get("lims", [-0.3, 0.3, -0.3, 0.3, 0.05, 1.0]))
+    ws_mask = workspace_mask(points, cfg.get("lims", [-0.3, 0.3, -0.3, 0.3, 0.05, 1.0]))
+    region_mode = "full"
     if selected is not None:
-        region &= bbox_region_mask(
+        region, region_mode = target_region_mask(
             points,
-            selected.bbox_xyxy,
+            selected,
             K,
+            image_shape=color_bgr.shape[:2],
+            base_mask=ws_mask,
+            use_mask=bool(cfg.get("use_mask_steering", True)),
+            mask_dilate_px=int(cfg.get("mask_dilate_px", 10)),
             margin_px=target_margin_px,
             expand_ratio=target_expand_ratio,
-            image_shape=color_bgr.shape[:2],
+            min_points=int(cfg.get("min_region_points", 300)),
         )
+    else:
+        region = ws_mask
 
     grasps = infer_grasps(
         detector, points, region, cfg, preferred_approach_cam=preferred_approach_cam
     )
-    pre_bbox = _copy_grasps(grasps)
+    pre_bbox = copy_grasp_group(grasps)
     if max_grasp_width_m is not None and len(grasps) > 0:
         grasps = grasps[np.asarray(grasps.widths) <= float(max_grasp_width_m)]
-    bbox_grasps = _copy_grasps(grasps)
+    bbox_grasps = copy_grasp_group(grasps)
     best = grasps[0] if len(grasps) else None
     elapsed = time.time() - tic
     target_status = (
@@ -330,10 +273,10 @@ def infer_frame(
         if yolo_model is not None else "YOLO disabled: full-scene AnyGrasp"
     )
     status = (
-        f"AnyGrasp grasps={len(grasps)} region_points={int(region.sum())} "
+        f"AnyGrasp grasps={len(grasps)} region({region_mode})={int(region.sum())} "
         f"cloud={len(points)} inference={elapsed:.2f}s"
     )
-    return AnyGraspFrameResult(
+    return GraspFrameResult(
         grasps=grasps,
         pre_bbox_grasps=pre_bbox,
         bbox_grasps=bbox_grasps,
@@ -344,27 +287,32 @@ def infer_frame(
         selected_target=selected,
         o3d_cloud=cloud,
         raw_cloud=points,
+        already_nms=not bool(cfg.get("dense_grasp", False)),
     )
 
 
 def check_grasp_base_geometry(
-    grasp: Grasp,
+    grasp: Any,
     T_cam2base: np.ndarray,
     pre6d: tuple[float, ...],
     grasp6d: tuple[float, ...],
     retreat6d: tuple[float, ...],
     safety: dict[str, Any],
 ) -> tuple[list[str], dict[str, Any]]:
-    """Additional AnyGrasp-only checks before the existing IK checks.
+    """Geometric safety checks in base frame before IK verification.
 
     This does not prove full-arm collision safety. It rejects unsafe geometry and
-    leaves reachability to the existing IK checker and execution controller.
+    leaves reachability to the IK planner and execution controller.
     """
     reasons: list[str] = []
     R = np.asarray(grasp.rotation_matrix, dtype=np.float64)
     T = np.asarray(T_cam2base, dtype=np.float64)
-    if R.shape != (3, 3) or not np.isfinite(R).all() or not np.allclose(R.T @ R, np.eye(3), atol=1e-4) \
-            or not np.isclose(np.linalg.det(R), 1.0, atol=1e-4):
+    if (
+        R.shape != (3, 3)
+        or not np.isfinite(R).all()
+        or not np.allclose(R.T @ R, np.eye(3), atol=1e-4)
+        or not np.isclose(np.linalg.det(R), 1.0, atol=1e-4)
+    ):
         reasons.append("invalid grasp rotation")
         return reasons, {}
     if T.shape != (4, 4) or not np.isfinite(T).all():
@@ -375,7 +323,7 @@ def check_grasp_base_geometry(
     max_width = float(safety.get("max_gripper_width", 0.09))
     margin = float(safety.get("width_margin_m", 0.003))
     if not 0.0 < width <= max_width - margin:
-        reasons.append(f"width={width:.3f}m exceeds safe limit={max_width-margin:.3f}m")
+        reasons.append(f"width={width:.3f}m exceeds safe limit={max_width - margin:.3f}m")
 
     approach = T[:3, :3] @ R[:, 0]
     approach /= max(np.linalg.norm(approach), 1e-12)
